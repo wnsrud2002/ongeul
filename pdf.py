@@ -663,6 +663,10 @@ class Font:
                 out.append(chr(code))
             elif step == 1 and code >= 160:
                 out.append(bytes([code]).decode("cp1252", "replace"))
+            elif step == 2 and code == 0:
+                # 글리프 0 = .notdef. PDF 규격상 아무것도 그리지 않는다. 글자가
+                # 아니므로 잃어버린 글자로 세지 않는다.
+                continue
             else:
                 out.append("�")
                 bad.append(code)

@@ -354,11 +354,14 @@ def join_part(base: str, target: str) -> str:
 REL_TARGET = re.compile(rb'Target="([^"]+)"')
 
 
-def referenced_parts(zf, prefix: str) -> set:
-    """패키지의 모든 .rels가 가리키는 대상 이름(파일명 기준)."""
+def referenced_parts(zf, prefix: str, only: str = "") -> set:
+    """패키지의 .rels가 가리키는 대상 이름(파일명 기준).
+    only 를 주면 그 정규식에 맞는 관계 파일만 본다(본문과 서식을 가르기 위해)."""
     out = set()
     for n in zf.namelist():
         if not n.endswith(".rels"):
+            continue
+        if only and not re.match(only, n):
             continue
         try:
             data = zf.read(n)
@@ -371,21 +374,32 @@ def referenced_parts(zf, prefix: str) -> set:
     return out
 
 
-def check_orphan_media(res: Res, zf, media_prefix: str, rendered: set) -> None:
-    """본문에 그리지 못한 자산을 구분해 보고한다.
-    어디에서도 참조하지 않는 잔여 파일은 문서 내용이 아니므로 등급을 내리지 않는다."""
+def check_orphan_media(res: Res, zf, media_prefix: str, rendered: set,
+                       content_rels: str = "") -> None:
+    """본문에 그리지 못한 자산을 세 갈래로 나눈다.
+
+    본문이 가리키는데 못 그렸으면 진짜 문제(unverified). 슬라이드 마스터·레이아웃의
+    배경·로고나, 아무도 가리키지 않는 잔여 파일은 본문 내용이 아니므로 바이트만
+    보존하고 등급은 내리지 않는다."""
     media = [n for n in zf.namelist() if n.startswith(media_prefix) and not n.endswith("/")]
     refs = referenced_parts(zf, "media/")
-    orphan = []
+    body_refs = referenced_parts(zf, "media/", content_rels) if content_rels else refs
+    orphan, template = [], []
     for n in media:
         if n in rendered:
             continue
         res.assets.setdefault("media/" + Path(n).name, zf.read(n))
-        if Path(n).name in refs:
+        if Path(n).name in body_refs:
             res.warn("문서가 참조하지만 본문 위치를 확인하지 못한 자산을 보존했다: %s" % n)
             res.demote(UNVERIFIED)
+        elif Path(n).name in refs:
+            template.append(n)
         else:
             orphan.append(n)
+    if template:
+        res.info["template_media"] = len(template)
+        res.markdown += ("\n> 서식(슬라이드 마스터·레이아웃)의 배경·로고 이미지 %d개를 보조 "
+                         "폴더에 원본 그대로 보존했다(본문 내용은 아니다).\n" % len(template))
     if orphan:
         res.info["orphan_media"] = len(orphan)
         res.markdown += ("\n> 패키지에 남아 있지만 문서 어느 부분도 참조하지 않는 이미지 %d개를 "
@@ -1359,7 +1373,10 @@ def verify_xlsx(res: Res, path: Path, cellmap: dict, limits: Limits) -> None:
             for c in sx.iter(q("x", "c")):
                 coord = c.get("r")
                 t = c.get("t")
-                if xfs is not None and c.get("s") and (name, coord) in cellmap:
+                # 병합 잔여 값은 openpyxl이 준 것이 아니라 원본 XML에서 직접 건진
+                # 것이라 표시 형식 정보가 없다. 그 셀은 형식 대조 대상이 아니다.
+                if (xfs is not None and c.get("s") and (name, coord) in cellmap
+                        and cellmap[(name, coord)].get("type") != "merged-hidden"):
                     try:
                         want_id = xfs[int(c.get("s"))]
                     except (ValueError, IndexError):
@@ -2158,7 +2175,9 @@ def verify_hwp(res: Res, sections: dict, streams: dict, hdr, bins: list | None =
     ref_streams = set()
     for idx in referenced:
         if bins and 1 <= idx <= len(bins):
-            ref_streams.add("BIN%04X" % (bins[idx - 1].get("id", 0)))
+            item = bins[idx - 1]
+            ref_streams.add(("BIN%04X.%s" % (item.get("id", 0),
+                                             item.get("ext", "bin"))).lower())
     bin_streams = [k for k in streams if k.startswith("BinData/")]
     saved = {i["part"] for i in res.meta.get("images", [])}
     orphan = []
@@ -2170,7 +2189,7 @@ def verify_hwp(res: Res, sections: dict, streams: dict, hdr, bins: list | None =
         except hwp5.HwpError:
             data = streams[k]
         res.assets.setdefault("media/" + Path(k).name, data)
-        if Path(k).stem.upper() in ref_streams:
+        if Path(k).name.lower() in ref_streams:
             res.warn("문서가 가리키지만 본문 위치를 확인하지 못한 자산을 보존했다: %s" % k)
             res.demote(UNVERIFIED)
         else:
@@ -2510,7 +2529,9 @@ def verify_pptx(res: Res, zf, limits: Limits) -> None:
     res.checks.append({"item": "텍스트 노드", "count": sum(wanted.values()),
                        "missing": sum(n for _, _, n in missing), "ok": not missing})
     report_missing(res, missing)
-    check_orphan_media(res, zf, "ppt/media/", {i["part"] for i in res.meta.get("images", [])})
+    check_orphan_media(res, zf, "ppt/media/",
+                       {i["part"] for i in res.meta.get("images", [])},
+                       content_rels=r"ppt/(slides|notesSlides)/_rels/")
 
 
 # ---------------------------------------------------------------- OCR (외부 엔진)
