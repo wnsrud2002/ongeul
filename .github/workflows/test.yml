@@ -27,12 +27,20 @@ jobs:
       - name: 의존성 설치
         run: python -m pip install --upgrade pip openpyxl pillow
 
-      # 창 화면 테스트는 화면이 없으면 스스로 건너뛴다. 리눅스에선 tkinter 자체가 없을 수 있다.
-      - name: tkinter 설치 (리눅스)
+      # 리눅스 러너에는 tkinter도 화면도 OCR 엔진도 없다. 셋 다 넣어야 GUI·OCR
+      # 테스트가 건너뛰지 않고 실제로 돈다.
+      - name: tkinter·가상 화면·OCR 설치 (리눅스)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y python3-tk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb tesseract-ocr tesseract-ocr-kor
 
-      - name: 테스트
+      - name: 테스트 (리눅스, 가상 화면)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s . -p 'test_*.py' -v
+
+      - name: 테스트 (macOS)
+        if: runner.os == 'macOS'
         run: python -m unittest discover -s . -p 'test_*.py' -v
 
       - name: 실제로 변환되는지 (합성 샘플 한 바퀴)
