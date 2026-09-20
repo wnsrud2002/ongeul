@@ -3153,6 +3153,7 @@ def make_pdfs(res: Res, src: Path, target: Path, assets_dir: Path, opts, limits:
         return []
     made = {}
     files: list = []
+    report: dict = {}
     if want in ("result", "both"):
         final_name = target.with_suffix(".pdf").name
         out_pdf = work / final_name
@@ -3168,18 +3169,22 @@ def make_pdfs(res: Res, src: Path, target: Path, assets_dir: Path, opts, limits:
                 shutil.rmtree(tmp, ignore_errors=True)
             if err:
                 res.warn("결과 PDF를 만들지 못했다: %s" % err)
-                return
+                return []
         else:
-            font, why = pdfwrite.find_font(getattr(opts, "pdf_font", None))
+            body = res.markdown + status_section(res)
+            font, why = pdfwrite.find_font(getattr(opts, "pdf_font", None), sample=body)
             if font is None:
-                res.warn("결과 PDF를 만들지 못했다: %s" % why)
-                return
+                res.warn("결과 PDF를 만들지 못했다: %s. --pdf-font 로 글꼴을 지정할 수 있다." % why)
+                return []
             try:
                 out_pdf.write_bytes(pdfwrite.render_markdown(
-                    res.markdown + status_section(res), font, src.name, base_dir=assets_dir))
+                    body, font, src.name, base_dir=assets_dir, report=report))
             except (pdfwrite.FontError, OSError, ValueError, struct.error) as exc:
                 res.warn("결과 PDF를 만들지 못했다: %s: %s" % (type(exc).__name__, exc))
-                return
+                return []
+        if report.get("missing_total"):
+            res.warn("PDF 글꼴에 없는 글자 %d개는 빈 네모로 그려진다: %r"
+                     % (report["missing_total"], list(report.get("missing_chars", {}))[:8]))
         pages, checked, miss = verify_made_pdf(out_pdf, res.markdown)
         if _pdf_is_garbage(checked, miss):
             out_pdf.unlink(missing_ok=True)

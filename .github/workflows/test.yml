@@ -33,7 +33,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk xvfb tesseract-ocr tesseract-ocr-kor
+          sudo apt-get install -y python3-tk xvfb tesseract-ocr tesseract-ocr-kor fonts-nanum
 
       - name: 테스트 (리눅스, 가상 화면)
         if: runner.os == 'Linux'

@@ -1934,12 +1934,15 @@ MD_SAMPLE = """# 온글 PDF 시험
 """
 
 
+KOREAN_PROBE = "온글 한글 가나다 체육대회 漢字"
+
+
 class TestPdfWrite(Tmp):
     def setUp(self):
         super().setUp()
-        self.font, why = pdfwrite.find_font()
+        self.font, why = pdfwrite.find_font(sample=KOREAN_PROBE)
         if self.font is None:
-            self.skipTest(why)
+            self.skipTest("한글을 그릴 글꼴이 없다: %s" % why)
 
     def test_subset_is_small_and_keeps_used_glyphs(self):
         text = "온글 가나다 ABC"
@@ -1989,8 +1992,8 @@ class TestPdfWrite(Tmp):
 class TestPdfExport(Tmp):
     def setUp(self):
         super().setUp()
-        if pdfwrite.find_font()[0] is None:
-            self.skipTest("PDF 글꼴 없음")
+        if pdfwrite.find_font(sample=KOREAN_PROBE)[0] is None:
+            self.skipTest("한글을 그릴 글꼴이 없다")
 
     def test_result_pdf_is_made_and_checked(self):
         make_docx(self.inp / "계약서.docx")
@@ -2043,8 +2046,8 @@ class TestPdfExport(Tmp):
         """PDF에 본문이 빠지면 경고한다. Markdown 자체는 영향받지 않는다."""
         make_docx(self.inp / "b.docx")
         saved = pdfwrite.render_markdown
-        pdfwrite.render_markdown = lambda md, font, title, base_dir=None: saved(
-            "# 제목만 남긴다", font, title, base_dir)
+        pdfwrite.render_markdown = lambda md, font, title, base_dir=None, report=None: saved(
+            "# 제목만 남긴다", font, title, base_dir, report)
         try:
             code = self.run_cli(self.inp / "b.docx", "--out", self.out, "--pdf", "result")
         finally:
@@ -2054,3 +2057,26 @@ class TestPdfExport(Tmp):
         self.assertIn("본문이", md)
         self.assertIn("Markdown 은 그대로다", md)
         self.assertFalse((self.out / "b.docx.pdf").exists())   # 쓰레기를 남기지 않는다
+
+
+class TestPdfFontCoverage(Tmp):
+    def test_font_without_korean_is_refused(self):
+        """한글을 못 그리는 글꼴로 PDF를 만들면 빈 네모만 남는다. 미리 거른다."""
+        font, why = pdfwrite.find_font(sample="ABC 123")
+        if font is None:
+            self.skipTest(why)
+        self.assertGreater(pdfwrite.covers(font, "ABC"), 0.9)
+        fake = font.gid
+        try:
+            font.gid = lambda c: 0 if ord(c) > 0x2000 else fake(c)   # 한글이 없는 셈
+            self.assertLess(pdfwrite.covers(font, "가나다"), 0.1)
+        finally:
+            font.gid = fake
+
+    def test_missing_glyphs_are_reported(self):
+        font, why = pdfwrite.find_font(sample="ABC")
+        if font is None:
+            self.skipTest(why)
+        report = {}
+        pdfwrite.render_markdown("보통 글자\n\n\ue000\ue001 사용자 영역", font, "x", report=report)
+        self.assertGreaterEqual(report["missing_total"], 2)   # 글꼴에 없는 글자를 센다

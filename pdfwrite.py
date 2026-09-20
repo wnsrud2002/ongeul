@@ -338,6 +338,7 @@ class Writer:
         self.base = base_dir
         self.doc = PdfDoc()
         self.used: dict[int, str] = {}
+        self.missing: dict[str, int] = {}
         self.pages: list[int] = []
         self.images: dict[str, tuple] = {}
         self.ops: list[str] = []
@@ -354,7 +355,10 @@ class Writer:
         out = []
         for c in s:
             g = self.font.gid(c)
-            self.used.setdefault(g, c)
+            if g == 0 and not c.isspace():
+                self.missing[c] = self.missing.get(c, 0) + 1   # 빈 네모로 그려질 글자
+            else:
+                self.used.setdefault(g, c)
             out.append("%04X" % g)
         return "".join(out)
 
@@ -567,10 +571,21 @@ FONT_CANDIDATES = (
 _FONT_CACHE: dict = {}
 
 
-def find_font(explicit: str | None = None):
-    """PDF에 넣을 글꼴을 찾는다. (글꼴, 사유). 임베딩이 금지된 글꼴은 쓰지 않는다."""
+def covers(font: "TtfFont", sample: str) -> float:
+    """글꼴이 이 글자들을 실제로 갖고 있는 비율. 없는 글자는 빈 네모로 그려져
+    멀쩡해 보이는 엉터리 PDF가 나오므로 미리 본다."""
+    chars = {c for c in sample if not c.isspace()}
+    if not chars:
+        return 1.0
+    return sum(1 for c in chars if font.gid(c)) / float(len(chars))
+
+
+def find_font(explicit: str | None = None, sample: str = ""):
+    """PDF에 넣을 글꼴을 찾는다. (글꼴, 사유).
+    임베딩이 금지됐거나 본문 글자를 못 그리는 글꼴은 쓰지 않는다."""
     from pathlib import Path as _Path
     tried = []
+    probe = sample[:4000]
     for cand in ([explicit] if explicit else []) + list(FONT_CANDIDATES):
         if not cand:
             continue
@@ -579,24 +594,31 @@ def find_font(explicit: str | None = None):
             tried.append("%s: 없음" % p.name)
             continue
         key = str(p)
-        if key in _FONT_CACHE:
-            return _FONT_CACHE[key], ""
-        try:
-            font = TtfFont(p.read_bytes())
-        except (FontError, struct.error, ValueError) as exc:
-            tried.append("%s: %s" % (p.name, exc))
-            continue
-        if not font.embeddable:
-            tried.append("%s: 글꼴 제작자가 임베딩을 금지했다" % p.name)
-            continue
-        font.source_name = p.name
-        _FONT_CACHE[key] = font
+        font = _FONT_CACHE.get(key)
+        if font is None:
+            try:
+                font = TtfFont(p.read_bytes())
+            except (FontError, struct.error, ValueError) as exc:
+                tried.append("%s: %s" % (p.name, exc))
+                continue
+            if not font.embeddable:
+                tried.append("%s: 글꼴 제작자가 임베딩을 금지했다" % p.name)
+                continue
+            font.source_name = p.name
+            _FONT_CACHE[key] = font
+        if probe:
+            rate = covers(font, probe)
+            if rate < 0.98:
+                tried.append("%s: 본문 글자의 %.0f%%만 갖고 있다" % (p.name, rate * 100))
+                continue
         return font, ""
-    return None, "PDF에 넣을 수 있는 글꼴을 찾지 못했다 (%s)" % "; ".join(tried[:4])
+    return None, "본문을 그릴 수 있는 글꼴을 찾지 못했다 (%s)" % "; ".join(tried[:4])
 
 
-def render_markdown(md: str, font: TtfFont, title: str, base_dir=None) -> bytes:
-    """온글이 만든 Markdown 을 PDF 로 그린다. 우리가 쓰는 표기만 다룬다."""
+def render_markdown(md: str, font: TtfFont, title: str, base_dir=None,
+                    report: dict | None = None) -> bytes:
+    """온글이 만든 Markdown 을 PDF 로 그린다. 우리가 쓰는 표기만 다룬다.
+    report 를 주면 글꼴에 없어 못 그린 글자를 담아 돌려준다."""
     import re
     from pathlib import Path as _P
     w = Writer(font, title=title, base_dir=base_dir)
@@ -665,4 +687,10 @@ def render_markdown(md: str, font: TtfFont, title: str, base_dir=None) -> bytes:
             continue
         w.paragraph(plain(line))
         i += 1
-    return w.save()
+    out = w.save()
+    if report is not None:
+        report["missing_chars"] = dict(sorted(w.missing.items(), key=lambda kv: -kv[1])[:20])
+        report["missing_total"] = sum(w.missing.values())
+        report["pages"] = len(w.pages)
+        report["font"] = getattr(font, "source_name", "?")
+    return out
