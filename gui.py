@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""mdmaker 창 화면. 명령줄과 같은 변환·검사 경로(run_batch)를 그대로 쓴다.
+"""온글 — 문서를 Markdown으로 (창 화면).
+
+명령줄(mdmaker.py)과 같은 변환·검사 경로(run_batch)를 그대로 쓴다.
 
 표준 라이브러리 tkinter만 사용한다. 변환은 작업 스레드에서 돌리고 결과만
 큐로 받아 화면을 갱신한다(변환 중에도 창이 멈추지 않게).
@@ -50,7 +52,7 @@ class App:
         self.worker: threading.Thread | None = None
         self.stop = threading.Event()
         self.counts: dict = {}
-        root.title("mdmaker — 문서를 Markdown으로 (로컬 변환)")
+        root.title("온글 — 문서를 Markdown으로 · 로컬에서만 변환합니다")
         root.geometry("900x620")
         self._build()
         self.root.after(100, self._drain)
@@ -249,6 +251,18 @@ class App:
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--selftest" in argv:
+        # 앱 묶음이 제대로 서는지 창을 띄우지 않고 확인한다.
+        root = tk.Tk()
+        root.withdraw()
+        app = App(root)
+        root.update_idletasks()
+        ok = root.winfo_reqwidth() > 400 and len(app.tree["columns"]) == 4
+        root.destroy()
+        print("온글 자체 점검: %s (파이썬 %s)"
+              % ("정상" if ok else "실패", sys.version.split()[0]))
+        return 0 if ok else 1
     root = tk.Tk()
     App(root)
     root.mainloop()

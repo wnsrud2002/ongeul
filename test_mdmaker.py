@@ -5,7 +5,9 @@ import base64
 import io
 import datetime
 import json
+import os
 import shutil
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -1629,3 +1631,46 @@ class TestGui(Tmp):
             M.run_batch = saved
         items = self._drain_now()
         self.assertTrue(any("일부러 낸 오류" in (i.get("error") or "") for i in items))
+
+
+class TestAppBundle(Tmp):
+    """앱 묶음이 실제로 서는지 본다. macOS가 아니면 건너뛴다."""
+
+    def setUp(self):
+        super().setUp()
+        if sys.platform != "darwin":
+            self.skipTest("macOS 전용 묶음")
+        try:
+            import build_app
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        self.build_app = build_app
+
+    def test_bundle_structure_and_selftest(self):
+        import plistlib
+        import subprocess
+        app = self.build_app.build(Path(__file__).resolve().parent, self.d)
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleName"], "온글")
+        self.assertEqual(info["CFBundleExecutable"], "ongeul")
+        self.assertTrue(info["NSHighResolutionCapable"])
+        for name in ("gui.py", "mdmaker.py", "hwp5.py", "pdf.py"):
+            self.assertTrue((app / "Contents" / "Resources" / "app" / name).exists(), name)
+        launcher = app / "Contents" / "MacOS" / "ongeul"
+        self.assertTrue(os.access(launcher, os.X_OK))
+        # 최소 환경에서도 파이썬을 찾아 창을 세울 수 있어야 한다
+        r = subprocess.run([str(launcher), "--selftest"], capture_output=True, shell=False,
+                           env={"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "")},
+                           timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[:300])
+        self.assertIn("정상", r.stdout.decode("utf-8", "replace"))
+
+    def test_icon_is_drawn_at_small_size(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow 없음")
+        im = self.build_app.draw_icon(32)
+        self.assertEqual(im.size, (32, 32))
+        colors = {p[:3] for p in im.getdata() if p[3] > 200}
+        self.assertGreater(len(colors), 4)       # 단색 사각형이 아니라 그림이 들어있다

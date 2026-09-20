@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""mdmaker: 로컬 문서를 Markdown으로 변환한다 (txt/md/csv/tsv/docx/xlsx/hwpx).
+"""온글(mdmaker): 로컬 문서를 Markdown으로 변환한다.
+
+지원: txt/md/csv/tsv, docx, xlsx, pptx, hwpx, hwp 5.x, pdf, 이미지, 구형 오피스.
 
 완전 보존이 최우선이다. 변환 결과는 항상 "원본을 변환기와 다른 경로로 다시 읽어"
 만든 요소 목록과 대조하며, 대조를 통과하지 못하면 success로 올리지 않는다.
@@ -2998,7 +3000,7 @@ def peak_memory_mb() -> float:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="로컬 문서를 완전 보존 기준으로 Markdown으로 변환한다 (외부 API 없음)")
+        description="온글 — 로컬 문서를 완전 보존 기준으로 Markdown으로 변환한다 (외부 API 없음)")
     ap.add_argument("input", help="입력 파일 또는 폴더 (URL 불가)")
     ap.add_argument("--out", required=True, help="출력 폴더")
     ap.add_argument("--recursive", action="store_true", help="하위 폴더까지 처리")
