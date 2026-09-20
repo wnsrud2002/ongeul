@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# 실제 문서로 돌린 변환 결과는 저장소에 넣지 않는다
+out/
+samples_out/
