@@ -875,10 +875,12 @@ class TestRealWorldQuirks(Tmp):
         with zipfile.ZipFile(p, "w") as o:
             for n, d in parts.items():
                 o.writestr(n, d)
-        self.assertEqual(self.run_cli(p, "--out", self.out), 1)   # 복구 후 unverified
-        md = self.md_of("대체콘텐츠.xlsx", incomplete=True)
+        # 복구해서 읽고, 표시 형식은 원본 styles.xml 과 따로 대조해 통과한다
+        self.assertEqual(self.run_cli(p, "--out", self.out), 0)
+        md = self.md_of("대체콘텐츠.xlsx")
         self.assertIn("항목", md)                                   # 내용은 살아 있다
         self.assertIn("styles.xml을 그대로는 읽지 못해", md)
+        self.assertIn('"item": "표시 형식"', md)
 
     def test_value_hidden_in_merged_range(self):
         """병합 범위의 좌상단이 아닌 칸에 남은 값도 버리지 않는다."""
@@ -906,10 +908,12 @@ class TestRealWorldQuirks(Tmp):
     def test_extension_lies_about_format(self):
         p = self.inp / "사실은한글.hwpx"
         make_hwp(p)
-        self.assertEqual(self.run_cli(p, "--out", self.out), 1)
-        md = self.md_of("사실은한글.hwpx", incomplete=True)
+        # 확장자가 틀렸다는 사실은 남기되, 내용 검사 결과를 바꾸지는 않는다
+        self.assertEqual(self.run_cli(p, "--out", self.out), 0)
+        md = self.md_of("사실은한글.hwpx")
         self.assertIn("# 한글 제목", md)                             # 내용 기준으로 변환
         self.assertIn("확장자는 .hwpx지만 내용은 hwp다", md)
+        self.assertIn("검사도 그 형식으로 했다", md)
 
     def test_literal_cr_in_docx_text(self):
         """XML 파서는 리터럴 CR을 LF로 바꾼다. 검사기도 같은 기준이어야 한다."""
@@ -1799,3 +1803,56 @@ class TestFailureDetection(Tmp):
         self.assertEqual(self.run_cli(self.inp, "--out", self.out, "--recursive"), 1)
         self.assertTrue((self.out / "ok.txt.md").exists())
         self.assertTrue((self.out / "_incomplete" / "bad.pdf.md").exists())
+
+
+class TestXlsxVerification(Tmp):
+    def test_number_format_mismatch_is_caught(self):
+        """표시 형식이 원본과 다르면 잡아낸다(복구본을 무조건 믿지 않는다)."""
+        p = self.inp / "서식.xlsx"
+        make_xlsx(p)
+        res = M.convert(p, argparse.Namespace(encoding=None, xlsx_table="auto",
+                                              max_cells=10 ** 7, ocr="off", ocr_lang="k"),
+                        M.Limits())
+        self.assertEqual(res.status, M.SUCCESS)
+        fmt = [c for c in res.checks if c["item"] == "표시 형식"][0]
+        self.assertGreater(fmt["count"], 0)      # 실제로 대조한 셀이 있다
+        self.assertTrue(fmt["ok"])
+        # 형식을 몰래 바꾼 셈 치면 불일치로 잡혀야 한다
+        tampered = M.Res(p, "xlsx")
+        tampered.markdown = res.markdown
+        tampered.meta = {"images": []}
+        cellmap = {}
+        import openpyxl
+        wb = openpyxl.load_workbook(p)
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for c in row:
+                    if c.value is not None:
+                        cellmap[(ws.title, c.coordinate)] = {
+                            "raw": c.value, "formula": None,
+                            "rendered": M._xl_value(c.value),
+                            "nf": "엉뚱한서식", "type": c.data_type}
+        M.verify_xlsx(tampered, p, cellmap, M.Limits())
+        self.assertEqual(tampered.status, M.PARTIAL)
+        self.assertIn("number_format", " ".join(tampered.warnings))
+
+    def test_image_anchor_cell_is_recorded(self):
+        """그림이 어느 칸에 붙었는지 원본에서 읽어 본문에 적는다."""
+        import openpyxl
+        from openpyxl.drawing.image import Image as XLImage
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow 없음")
+        p = self.inp / "그림.xlsx"
+        make_xlsx(p)
+        wb = openpyxl.load_workbook(p)
+        img_path = self.inp / "점.png"
+        img_path.write_bytes(PNG)
+        wb["매출"].add_image(XLImage(str(img_path)), "D4")
+        wb.save(p)
+        self.assertEqual(self.run_cli(p, "--out", self.out), 0)
+        md = self.md_of("그림.xlsx")
+        self.assertIn("시트 `매출` 의 `D4` 칸", md)
+        meta = json.loads((self.out / "그림.xlsx.assets" / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["structure"]["image_anchors"]["매출"][0]["cell"], "D4")

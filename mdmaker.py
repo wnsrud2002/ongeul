@@ -19,6 +19,7 @@ import io
 import json
 import os
 import platform
+import posixpath
 import re
 import sys
 import tempfile
@@ -227,6 +228,17 @@ def header_block(res: Res, extra: dict | None = None) -> str:
 ENCODINGS = ("utf-8-sig", "cp949", "utf-16")
 
 
+def line_style(text: str) -> str:
+    if "\r\n" in text:
+        return "CRLF"
+    return "CR" if "\r" in text else "LF"
+
+
+def to_lf(text: str) -> str:
+    """가이드 6장이 결과를 LF로 쓰라고 한다. 원본 방식은 따로 기록한다."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def read_text(path: Path, encoding: str | None) -> tuple[str, str]:
     raw = path.read_bytes()
     if encoding:
@@ -244,6 +256,8 @@ def convert_text(path: Path, opts) -> Res:
     res = Res(path, fmt)
     text, enc = read_text(path, opts.encoding)
     res.info["encoding"] = enc
+    res.info["line_ending"] = line_style(text)
+    text = to_lf(text)
     res.info["chars"] = len(text)
     if fmt == "md":
         # 이미 Markdown이므로 그대로 둔다. 재작성하면 원문이 바뀐다.
@@ -266,6 +280,8 @@ def convert_csv(path: Path, opts) -> Res:
     res = Res(path, fmt)
     text, enc = read_text(path, opts.encoding)
     res.info["encoding"] = enc
+    res.info["line_ending"] = line_style(text)
+    text = to_lf(text)
     delim = "\t" if fmt == "tsv" else ","
     rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delim))
     if not rows:
@@ -289,6 +305,7 @@ def convert_csv(path: Path, opts) -> Res:
                    % ", ".join(str(x) for x in ragged))
     res.markdown = "\n".join(out) + "\n"
     res.meta = {"format": fmt, "delimiter": delim, "encoding": enc,
+                "line_ending": res.info["line_ending"],
                 "row_widths": [len(r) for r in rows]}
     # 검사: csv 모듈과 무관하게 원본 텍스트에서 셀을 다시 세어 대조한다.
     norm = normalize_md(res.markdown)
@@ -304,7 +321,7 @@ def convert_csv(path: Path, opts) -> Res:
 
 # ---------------------------------------------------------------- DOCX
 def _rels(zf, limits, part: str) -> dict:
-    name = str(Path(part).parent / "_rels" / (Path(part).name + ".rels"))
+    name = zip_join(zip_dir(part), "_rels", part.rsplit("/", 1)[-1] + ".rels")
     try:
         root = parse_xml(zf.read(name), limits)
     except (KeyError, ET.ParseError):
@@ -316,12 +333,22 @@ def _rels(zf, limits, part: str) -> dict:
     return out
 
 
+def zip_dir(name: str) -> str:
+    """zip 내부 경로의 상위 폴더. zip 이름은 항상 "/" 를 쓰므로 OS 구분자를 섞으면
+    윈도우에서 조각을 통째로 못 찾는다."""
+    return name.rsplit("/", 1)[0] if "/" in name else ""
+
+
+def zip_join(*parts: str) -> str:
+    return "/".join(p.strip("/") for p in parts if p)
+
+
 def join_part(base: str, target: str) -> str:
     """OOXML 관계의 Target을 패키지 경로로 바꾼다.
     `/ppt/...` 처럼 절대형으로 쓰는 생성기가 있어 앞의 /를 떼야 한다."""
     if target.startswith("/"):
-        return os.path.normpath(target[1:]).replace(os.sep, "/")
-    return os.path.normpath(str(Path(base) / target)).replace(os.sep, "/")
+        return posixpath.normpath(target[1:])
+    return posixpath.normpath(zip_join(base, target))
 
 
 REL_TARGET = re.compile(rb'Target="([^"]+)"')
@@ -519,8 +546,7 @@ def _dx_graphic(el, ctx) -> str:
 
 
 def _dx_save_asset(ctx, target: str) -> str | None:
-    rel = str(Path("word") / target) if not target.startswith("/") else target.lstrip("/")
-    rel = os.path.normpath(rel).replace(os.sep, "/")
+    rel = join_part("word", target)
     try:
         data = ctx.zf.read(rel)
     except KeyError:
@@ -941,12 +967,90 @@ def _xl_sheet_roots(zf, limits: Limits):
     rels = _rels(zf, limits, "xl/workbook.xml")
     for sh in wbx.iter(q("x", "sheet")):
         target = rels.get(sh.get(q("r", "id")), ("", "", ""))[0]
-        target = target[1:] if target.startswith("/") else "xl/" + target.lstrip("./")
         try:
-            yield sh.get("name"), parse_xml(zf.read(os.path.normpath(target).replace(os.sep, "/")),
-                                            limits)
+            yield sh.get("name"), parse_xml(zf.read(join_part("xl", target)), limits)
         except (KeyError, ET.ParseError):
             continue
+
+
+def _xl_style_formats(zf, limits: Limits):
+    """(cellXfs 순서대로의 numFmtId, 사용자 정의 형식표). styles.xml을 직접 읽는다.
+    openpyxl이 읽은 표시 형식이 원본과 같은지 따로 확인하기 위한 것이다."""
+    try:
+        root = parse_xml(zf.read("xl/styles.xml"), limits)
+    except (KeyError, ValueError, ET.ParseError):
+        return None, {}
+    custom = {}
+    for nf in root.iter():
+        if _tag(nf) == "numFmt" and nf.get("numFmtId"):
+            try:
+                custom[int(nf.get("numFmtId"))] = nf.get("formatCode") or ""
+            except ValueError:
+                continue
+    holder = next((x for x in root.iter() if _tag(x) == "cellXfs"), None)
+    if holder is None:
+        return None, custom
+    xfs = []
+    for child in holder:
+        if _tag(child) == "AlternateContent":      # 감싼 항목도 한 자리를 차지한다
+            child = next((e for e in child.iter() if _tag(e) == "xf"), child)
+        try:
+            xfs.append(int(child.get("numFmtId") or 0))
+        except ValueError:
+            xfs.append(0)
+    return xfs, custom
+
+
+def _xl_image_anchors(path: Path, limits: Limits) -> dict:
+    """시트 이름 -> [{"cell", "asset"}]. 그림이 어느 칸에 붙어 있는지 원본에서 읽는다."""
+    from openpyxl.utils import get_column_letter
+    out: dict = {}
+    zf = open_zip(path, limits)
+    try:
+        for name, _sx in _xl_sheet_roots(zf, limits):
+            pass
+        wbx = parse_xml(zf.read("xl/workbook.xml"), limits)
+        rels = _rels(zf, limits, "xl/workbook.xml")
+        for sh in wbx.iter(q("x", "sheet")):
+            target = rels.get(sh.get(q("r", "id")), ("", "", ""))[0]
+            if not target:
+                continue
+            sheet_part = join_part("xl", target)
+            srels = _rels(zf, limits, sheet_part)
+            for rid, (t, _mode, typ) in srels.items():
+                if not typ.endswith("/drawing"):
+                    continue
+                dpart = join_part(zip_dir(sheet_part), t)
+                droot = _part(zf, limits, dpart)
+                if droot is None:
+                    continue
+                drels = _rels(zf, limits, dpart)
+                found = []
+                for anchor in droot:
+                    if _tag(anchor) not in ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor"):
+                        continue
+                    frm = next((x for x in anchor if _tag(x) == "from"), None)
+                    cell = ""
+                    if frm is not None:
+                        col = next((c.text for c in frm if _tag(c) == "col"), "0")
+                        row = next((c.text for c in frm if _tag(c) == "row"), "0")
+                        try:
+                            cell = "%s%d" % (get_column_letter(int(col) + 1), int(row) + 1)
+                        except (TypeError, ValueError):
+                            cell = ""
+                    for blip in anchor.iter():
+                        rid2 = blip.get(q("r", "embed")) if _tag(blip) == "blip" else None
+                        if not rid2:
+                            continue
+                        tgt = drels.get(rid2, ("", "", ""))[0]
+                        if tgt:
+                            found.append({"cell": cell or "(위치 미상)",
+                                          "asset": "media/" + Path(tgt).name})
+                if found:
+                    out.setdefault(sh.get("name"), []).extend(found)
+        return out
+    finally:
+        zf.close()
 
 
 def _xl_merged_leftovers(path: Path, limits: Limits) -> dict:
@@ -1021,10 +1125,9 @@ def convert_xlsx(path: Path, opts, limits: Limits) -> Res:
             raise
         wb = openpyxl.load_workbook(repaired, data_only=False, rich_text=False)
         wbv = openpyxl.load_workbook(repaired, data_only=True, rich_text=False)
-        res.warn("styles.xml을 그대로는 읽지 못해(%s: %s) 복사본에서 스타일 참조만 고쳐 읽었다. "
-                 "값·수식은 원본 그대로지만 표시 형식은 검증하지 못했다."
+        res.warn("styles.xml을 그대로는 읽지 못해(%s: %s) 복사본에서 스타일 참조만 고쳐 "
+                 "읽었다. 표시 형식은 원본 styles.xml과 따로 대조한다."
                  % (type(exc).__name__, str(exc)[:60]))
-        res.demote(UNVERIFIED)
     cellmap: dict = {}
     special: list = []
     sheets_meta: list = []
@@ -1164,10 +1267,19 @@ def convert_xlsx(path: Path, opts, limits: Limits) -> Res:
         for n in ext:
             res.assets["structure/external/" + Path(n).name] = zf.read(n)
         if media or drawings:
-            out.append("\n> 이미지·도형 %d개와 배치 정보를 보조 폴더에 원본 그대로 보존했다. "
-                       "Markdown 본문 안의 위치까지는 검증하지 못했다." % len(media))
-            res.warn("이미지·도형의 셀 배치는 자동 검증하지 못했다")
-            res.demote(UNVERIFIED)
+            anchors = _xl_image_anchors(path, limits)
+            placed = {a["asset"] for v in anchors.values() for a in v}
+            out.append("")
+            out.append("> 이미지·도형 %d개를 보조 폴더에 원본 그대로 보존했다." % len(media))
+            for sheet, items in sorted(anchors.items()):
+                for a in items:
+                    out.append("> - 시트 `%s` 의 `%s` 칸: `%s`"
+                               % (esc_inline(sheet), a["cell"], a["asset"]))
+            res.meta_anchors = anchors
+            unplaced = [n for n in media if "media/" + Path(n).name not in placed]
+            if unplaced:
+                res.warn("그림 %d개는 붙어 있는 칸을 찾지 못했다(바이트는 보존)" % len(unplaced))
+                res.demote(UNVERIFIED)
         if ext:
             out.append("\n> 외부 링크 정의가 있다. 값을 가져오지 않고 정의만 보존했다.")
             res.warn("외부 링크 정의가 있다. 저장된 값만 사용했다")
@@ -1177,6 +1289,7 @@ def convert_xlsx(path: Path, opts, limits: Limits) -> Res:
 
     res.markdown = "\n".join(out) + "\n"
     res.meta = {"format": "xlsx", "sheets": sheets_meta, "cells": special,
+                "image_anchors": getattr(res, "meta_anchors", {}),
                 "note": "raw는 저장된 값, serial은 엑셀 내부 숫자 표현이다. 표시 형식(number_format)은 "
                         "문자열로 보존하며 mdmaker가 화면 표시를 재현하지는 않는다."}
     res.info["chars"] = len(res.markdown)
@@ -1218,8 +1331,7 @@ def verify_xlsx(res: Res, path: Path, cellmap: dict, limits: Limits) -> None:
             rid = sh.get(q("r", "id"))
             target = rels.get(rid, ("", "", ""))[0]
             # openpyxl은 절대형(/xl/...), Excel은 상대형(worksheets/...)으로 쓴다
-            target = target[1:] if target.startswith("/") else "xl/" + target.lstrip("./")
-            sheets.append((sh.get("name"), os.path.normpath(target).replace(os.sep, "/")))
+            sheets.append((sh.get("name"), join_part("xl", target)))
         shared = []
         try:
             ss = parse_xml(zf.read("xl/sharedStrings.xml"), limits)
@@ -1229,6 +1341,8 @@ def verify_xlsx(res: Res, path: Path, cellmap: dict, limits: Limits) -> None:
             pass
 
         norm = normalize_md(res.markdown)
+        xfs, custom = _xl_style_formats(zf, limits)
+        fmt_checked = fmt_bad = 0
         total, missing, mismatch, shared_ok = 0, [], [], 0
         for name, target in sheets:
             try:
@@ -1245,6 +1359,16 @@ def verify_xlsx(res: Res, path: Path, cellmap: dict, limits: Limits) -> None:
             for c in sx.iter(q("x", "c")):
                 coord = c.get("r")
                 t = c.get("t")
+                if xfs is not None and c.get("s") and (name, coord) in cellmap:
+                    try:
+                        want_id = xfs[int(c.get("s"))]
+                    except (ValueError, IndexError):
+                        want_id = None
+                    if want_id in custom:          # 파일이 정의한 서식만 대조한다
+                        fmt_checked += 1
+                        if (cellmap[(name, coord)].get("nf") or "") != custom[want_id]:
+                            fmt_bad += 1
+                            mismatch.append((name, coord, "number_format"))
                 fe = c.find(q("x", "f"))
                 ve = c.find(q("x", "v"))
                 ise = c.find(q("x", "is"))
@@ -1313,6 +1437,12 @@ def verify_xlsx(res: Res, path: Path, cellmap: dict, limits: Limits) -> None:
         res.checks.append({"item": "셀", "count": total, "missing": len(missing),
                            "mismatch": len(mismatch), "shared_formula": shared_ok,
                            "ok": not missing and not mismatch})
+        if xfs is None:
+            res.warn("styles.xml이 없어 표시 형식을 대조하지 못했다")
+            res.demote(UNVERIFIED)
+        else:
+            res.checks.append({"item": "표시 형식", "count": fmt_checked, "mismatch": fmt_bad,
+                               "ok": fmt_bad == 0})
         if missing or mismatch:
             res.demote(PARTIAL)
             res.warn("셀 대조 실패 누락 %d개 %r / 불일치 %d개 %r"
@@ -1565,11 +1695,11 @@ def convert_hwpx(path: Path, opts, limits: Limits) -> Res:
             res.status = FAILED
             res.warn("패키지 정의(%s)가 없다. HWPX가 아닐 수 있다." % pkg_path)
             return res
-        base = str(Path(pkg_path).parent)
+        base = zip_dir(pkg_path)
         for it in pkg.iter():
             if _tag(it) == "item" and it.get("id") and it.get("href"):
                 href = it.get("href")
-                cand = os.path.normpath(os.path.join(base, href)).replace(os.sep, "/")
+                cand = posixpath.normpath(zip_join(base, href))
                 ctx.manifest[it.get("id")] = cand if cand in names else href
         spine = [x.get("idref") for x in pkg.iter() if _tag(x) == "itemref" and x.get("idref")]
         sections = [ctx.manifest[i] for i in spine
@@ -1987,11 +2117,11 @@ def convert_hwp(path: Path, opts, limits: Limits) -> Res:
         res.warn("문서 이력 또는 서명 정보가 있다. 본문 변환 대상이 아니라 그대로 두었다.")
         res.demote(UNVERIFIED)
     res.info["chars"] = len(res.markdown)
-    verify_hwp(res, sections, streams, hdr)
+    verify_hwp(res, sections, streams, hdr, ctx.bins)
     return res
 
 
-def verify_hwp(res: Res, sections: dict, streams: dict, hdr) -> None:
+def verify_hwp(res: Res, sections: dict, streams: dict, hdr, bins: list | None = None) -> None:
     """구조 순회와 별개로 PARA_TEXT 레코드만 평평하게 훑어 글자를 대조한다."""
     norm = normalize_md(res.markdown)
     wanted: collections.Counter = collections.Counter()
@@ -2013,19 +2143,44 @@ def verify_hwp(res: Res, sections: dict, streams: dict, hdr) -> None:
                        "missing": sum(n for _, _, n in missing), "ok": not missing})
     report_missing(res, missing)
 
-    bins = [k for k in streams if k.startswith("BinData/")]
+    # 어떤 그림 레코드도 가리키지 않는 BinData 는 문서 내용이 아니라 지우고 남은
+    # 잔여물이다. 바이트는 보존하되 그것 때문에 등급을 내리지는 않는다.
+    referenced: set = set()
+    for body in sections.values():
+        try:
+            for tag, _lvl, payload in hwp5.records(body):
+                if tag in (hwp5.TAG_SHAPE_PICTURE, hwp5.TAG_SHAPE_OLE):
+                    idx = hwp5.picture_bin_id(payload, len(bins or []))
+                    if idx:
+                        referenced.add(idx)
+        except hwp5.HwpError:
+            continue
+    ref_streams = set()
+    for idx in referenced:
+        if bins and 1 <= idx <= len(bins):
+            ref_streams.add("BIN%04X" % (bins[idx - 1].get("id", 0)))
+    bin_streams = [k for k in streams if k.startswith("BinData/")]
     saved = {i["part"] for i in res.meta.get("images", [])}
-    for k in bins:
-        if k not in saved:
-            try:
-                data = hwp5.decompress(streams[k], hdr.compressed)
-            except hwp5.HwpError:
-                data = streams[k]
-            res.assets.setdefault("media/" + Path(k).name, data)
-            res.warn("본문에서 참조를 확인하지 못한 자산을 그대로 보존했다: %s" % k)
+    orphan = []
+    for k in bin_streams:
+        if k in saved:
+            continue
+        try:
+            data = hwp5.decompress(streams[k], hdr.compressed)
+        except hwp5.HwpError:
+            data = streams[k]
+        res.assets.setdefault("media/" + Path(k).name, data)
+        if Path(k).stem.upper() in ref_streams:
+            res.warn("문서가 가리키지만 본문 위치를 확인하지 못한 자산을 보존했다: %s" % k)
             res.demote(UNVERIFIED)
-    res.checks.append({"item": "자산", "count": len(bins), "saved": len(res.assets),
-                       "ok": len(res.assets) >= len(bins)})
+        else:
+            orphan.append(k)
+    if orphan:
+        res.info["orphan_media"] = len(orphan)
+        res.markdown += ("\n> 문서 어느 그림도 가리키지 않는 자산 %d개를 보조 폴더에 원본 "
+                         "그대로 보존했다(본문 내용은 아니다).\n" % len(orphan))
+    res.checks.append({"item": "자산", "count": len(bin_streams), "saved": len(res.assets),
+                       "orphan": len(orphan), "ok": len(res.assets) >= len(bin_streams)})
 
 
 # ---------------------------------------------------------------- PPTX
@@ -2277,9 +2432,18 @@ def convert_pptx(path: Path, opts, limits: Limits) -> Res:
                 res.demote(PARTIAL)
                 continue
             ctx.rels = _rels(zf, limits, part)
-            ctx.part_dir = str(Path(part).parent)
+            ctx.part_dir = zip_dir(part)
             out.append("")
             out.append("## 슬라이드 %d (%s)" % (i, part))
+            for bg in root.iter():
+                if _tag(bg) != "bg":
+                    continue
+                for blip in bg.iter():
+                    rid = blip.get(q("r", "embed")) if _tag(blip) == "blip" else None
+                    if rid:
+                        asset = _px_asset(ctx, rid)
+                        if asset:
+                            out.append("> 슬라이드 배경 그림: `%s`" % asset)
             tree = next((x for x in root.iter() if _tag(x) == "spTree"), None)
             order: list = []
             if tree is not None:
@@ -2292,13 +2456,13 @@ def convert_pptx(path: Path, opts, limits: Limits) -> Res:
             for rid, (target, mode, typ) in _rels(zf, limits, part).items():
                 if not typ.endswith("/notesSlide"):
                     continue
-                npart = join_part(str(Path(part).parent), target)
+                npart = join_part(zip_dir(part), target)
                 nroot = _part(zf, limits, npart)
                 if nroot is None:
                     continue
                 saved_rels, saved_dir = ctx.rels, ctx.part_dir
                 ctx.rels = _rels(zf, limits, npart)
-                ctx.part_dir = str(Path(npart).parent)
+                ctx.part_dir = zip_dir(npart)
                 ntree = next((x for x in nroot.iter() if _tag(x) == "spTree"), None)
                 norder: list = []
                 if ntree is not None:
@@ -2720,8 +2884,9 @@ def convert(path: Path, opts, limits: Limits) -> Res:
             return res
         # 확장자가 틀린 파일을 확장자만 보고 실패시키지 않는다. 다만 사실을 기록한다.
         res = _convert_as(real, path, opts, limits)
-        res.warn("확장자는 %s지만 내용은 %s다. 내용 기준으로 변환했다." % (ext, real))
-        res.demote(UNVERIFIED)
+        # 확장자가 틀렸다는 사실이 내용 검증 결과를 바꾸지는 않는다. 사실만 남긴다.
+        res.warn("확장자는 %s지만 내용은 %s다. 내용 기준으로 변환했고 검사도 그 형식으로 했다."
+                 % (ext, real))
         return res
     return _convert_as(ext.lstrip("."), path, opts, limits)
 
