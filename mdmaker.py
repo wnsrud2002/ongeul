@@ -3028,6 +3028,13 @@ def peak_memory_mb() -> float:
 
 
 def main(argv=None) -> int:
+    # 윈도우 콘솔 기본 인코딩이 UTF-8이 아니면 한국어 출력에서 죽는다. 결과를 못 쓰는
+    # 것보다 글자가 깨지는 편이 낫다.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
     ap = argparse.ArgumentParser(
         description="온글 — 로컬 문서를 완전 보존 기준으로 Markdown으로 변환한다 (외부 API 없음)")
     ap.add_argument("input", help="입력 파일 또는 폴더 (URL 불가)")
