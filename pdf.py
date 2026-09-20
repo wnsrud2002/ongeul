@@ -665,7 +665,7 @@ class Font:
                 out.append(bytes([code]).decode("cp1252", "replace"))
             else:
                 out.append("�")
-                bad += 1
+                bad.append(code)
         return "".join(out), n, bad
 
 

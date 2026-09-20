@@ -1491,3 +1491,55 @@ class TestPdfImageRebuild(Tmp):
         self.assertTrue(list(adir.glob("*.raw")))               # 원본 표본도 남는다
         meta = json.loads((adir.parent / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(len(meta["structure"]["rebuilt_images"]), 1)
+
+
+class TestConcurrency(Tmp):
+    def test_two_runs_do_not_corrupt_output(self):
+        """덮어쓰기 금지 상태에서 동시 실행이 겹쳐도 결과가 깨지지 않는다(가이드 6장)."""
+        import threading
+        p = self.inp / "a.txt"
+        p.write_text("동시 실행 시험 " * 200, encoding="utf-8")
+        codes = []
+        barrier = threading.Barrier(4)
+
+        def run():
+            barrier.wait()
+            codes.append(M.main([str(p), "--out", str(self.out)]))
+
+        threads = [threading.Thread(target=run) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        md = self.md_of("a.txt")
+        self.assertIn("동시 실행 시험", md)
+        self.assertIn("상태: **success", md)            # 잘린 결과가 남지 않는다
+        self.assertEqual(sorted(codes), [0, 1, 1, 1])   # 하나만 쓰고 나머지는 충돌 보고
+        leftovers = [q for q in self.out.iterdir() if q.name.startswith(".mdmaker-")]
+        self.assertEqual(leftovers, [])
+
+
+class TestPdfUnmappedGlyphs(Tmp):
+    def test_unmappable_codes_are_counted_and_recorded(self):
+        """대응표가 없는 글자는 잃었다고 보고하고, 어떤 코드였는지 남긴다."""
+        objs = {
+            1: "<< /Type /Catalog /Pages 2 0 R >>",
+            2: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: ("<< /Type /Page /Parent 2 0 R /Contents 4 0 R"
+                " /Resources << /Font << /F1 5 0 R >> >> >>"),
+            4: _pdf_stream("", b"BT /F1 12 Tf 72 720 Td <00110022> Tj ET\n"),
+            # ToUnicode도 내장 폰트도 없는 Identity-H: 코드를 글자로 바꿀 방법이 없다
+            5: ("<< /Type /Font /Subtype /Type0 /BaseFont /NoMap /Encoding /Identity-H"
+                " /DescendantFonts [6 0 R] >>"),
+            6: "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NoMap >>",
+        }
+        p = self.inp / "대응표없음.pdf"
+        p.write_bytes(_pdf_build(objs))
+        self.assertEqual(self.run_cli(p, "--out", self.out), 1)
+        md = self.md_of("대응표없음.pdf", incomplete=True)
+        self.assertIn("유니코드로 바꾸지 못했다", md)
+        self.assertIn("partial", md)
+        meta = json.loads((self.out / "_incomplete" / "대응표없음.pdf.assets" / "meta.json")
+                          .read_text(encoding="utf-8"))
+        codes = meta["structure"]["pages"][0]["unmapped_codes"]
+        self.assertEqual(sorted(codes), ["0x0011×1", "0x0022×1"])

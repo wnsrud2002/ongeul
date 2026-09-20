@@ -2853,26 +2853,37 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
                 (tmp / fn).write_text(head + part, encoding="utf-8", newline="\n")
                 made_parts.append(tmp / fn)
         (tmp / "doc.md").write_text(res.markdown + status_section(res), encoding="utf-8", newline="\n")
-        if True:              # 보조 폴더는 언제나 만든다. meta.json이 보존 검사 기록이다.
-            adir = tmp / "assets"
-            adir.mkdir()
-            listing = []
-            for name, data in sorted(res.assets.items()):
-                p = adir / name
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_bytes(data)
-                listing.append({"path": name, "sha256": sha256(data), "bytes": len(data)})
-            (adir / "meta.json").write_text(json.dumps({
-                "source": src.name, "source_sha256": sha256(src.read_bytes()),
-                "format": res.fmt, "status": res.status, "warnings": res.warnings,
-                "checks": res.checks, "info": res.info, "assets": listing,
-                "structure": res.meta}, ensure_ascii=False, indent=2), encoding="utf-8")
-            if assets_dir.exists():
-                shutil.rmtree(assets_dir)
-            os.replace(adir, assets_dir)
+        adir = tmp / "assets"        # meta.json이 보존 검사 기록이라 항상 만든다
+        adir.mkdir()
+        listing = []
+        for name, data in sorted(res.assets.items()):
+            f2 = adir / name
+            f2.parent.mkdir(parents=True, exist_ok=True)
+            f2.write_bytes(data)
+            listing.append({"path": name, "sha256": sha256(data), "bytes": len(data)})
+        (adir / "meta.json").write_text(json.dumps({
+            "source": src.name, "source_sha256": sha256(src.read_bytes()),
+            "format": res.fmt, "status": res.status, "warnings": res.warnings,
+            "checks": res.checks, "info": res.info, "assets": listing,
+            "structure": res.meta}, ensure_ascii=False, indent=2), encoding="utf-8")
+        if opts.overwrite or ours:
+            os.replace(tmp / "doc.md", target)
+        else:
+            # 검사와 쓰기 사이에 다른 실행이 끼어들 수 있다. link는 원자적으로
+            # "없을 때만 만들기"라서 동시 실행 충돌을 여기서 잡는다.
+            try:
+                os.link(tmp / "doc.md", target)
+            except FileExistsError:
+                return target, "다른 실행이 방금 같은 결과를 만들었다(덮어쓰지 않음): %s" % target
+        # 본문 자리를 잡은 뒤에야 보조 폴더를 옮긴다(동시 실행에서 순서가 중요하다).
         for part in made_parts:
             os.replace(part, target.parent / part.name)
-        os.replace(tmp / "doc.md", target)
+        if assets_dir.exists():
+            shutil.rmtree(assets_dir, ignore_errors=True)
+        try:
+            os.replace(adir, assets_dir)
+        except OSError as exc:
+            return target, "보조 폴더를 놓지 못했다(동시 실행 충돌일 수 있다): %s" % exc
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return target, None
