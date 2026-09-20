@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """mdmaker 테스트. 표준 unittest만 쓰고, 샘플은 여기서 직접 만든다(사용자 문서 사용 금지)."""
 import base64
+import io
 import datetime
 import json
 import shutil
@@ -1411,3 +1412,82 @@ class TestRunInfo(Tmp):
                   "converter", "check_version", "chars"):
             self.assertIn(k, info)
         self.assertEqual(info["source_bytes"], p.stat().st_size)
+
+
+def _text_image(text: str, size=(420, 90)) -> bytes:
+    """OCR이 읽을 수 있는 글자 이미지를 만든다. Pillow가 없으면 None."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return b""
+    im = Image.new("L", size, 255)
+    d = ImageDraw.Draw(im)
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 40)
+    except (ImportError, OSError):
+        font = None
+    d.text((10, 20), text, fill=0, font=font)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class TestOcr(Tmp):
+    def setUp(self):
+        super().setUp()
+        if not M.ocr_available():
+            self.skipTest("tesseract 가 없다")
+        self.img = _text_image("MDMAKER OCR 2026")
+        if not self.img:
+            self.skipTest("Pillow 가 없다")
+
+    def test_ocr_reads_image_and_marks_unverified(self):
+        p = self.inp / "글자.png"
+        p.write_bytes(self.img)
+        self.assertEqual(self.run_cli(p, "--out", self.out, "--ocr", "force", "--ocr-lang", "eng"), 1)
+        md = self.md_of("글자.png", incomplete=True)
+        self.assertIn("MDMAKER", md.upper())
+        self.assertIn("검수 전", md)
+        self.assertIn("unverified", md)          # OCR 결과는 성공으로 올리지 않는다
+
+    def test_ocr_off_by_default(self):
+        p = self.inp / "글자.png"
+        p.write_bytes(self.img)
+        self.run_cli(p, "--out", self.out)
+        md = self.md_of("글자.png", incomplete=True)
+        self.assertNotIn("OCR 결과", md)
+        self.assertIn("OCR 미수행", md)
+
+    def test_original_image_kept_alongside_ocr(self):
+        p = self.inp / "글자.png"
+        p.write_bytes(self.img)
+        self.run_cli(p, "--out", self.out, "--ocr", "force", "--ocr-lang", "eng")
+        kept = self.out / "_incomplete" / "글자.png.assets" / "media" / "글자.png"
+        self.assertEqual(kept.read_bytes(), self.img)
+
+
+class TestPdfImageRebuild(Tmp):
+    def test_raw_bitmap_becomes_viewable_png(self):
+        """PDF 이미지는 파일이 아니라 원시 표본이다. 원본 바이트는 두고 PNG를 따로 만든다."""
+        import zlib
+        raw = bytes([(x * 7 + y * 3) % 256 for y in range(8) for x in range(8) for _ in range(3)])
+        objs = {
+            1: "<< /Type /Catalog /Pages 2 0 R >>",
+            2: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: ("<< /Type /Page /Parent 2 0 R /Contents 4 0 R"
+                " /Resources << /XObject << /Im1 5 0 R >> >> >>"),
+            4: _pdf_stream("", b"q 100 0 0 100 0 0 cm /Im1 Do Q\n"),
+            5: _pdf_stream("/Type /XObject /Subtype /Image /Width 8 /Height 8"
+                           " /ColorSpace /DeviceRGB /BitsPerComponent 8", raw),
+        }
+        p = self.inp / "비트맵.pdf"
+        p.write_bytes(_pdf_build(objs))
+        self.assertEqual(self.run_cli(p, "--out", self.out), 1)
+        adir = self.out / "_incomplete" / "비트맵.pdf.assets" / "media"
+        png = list(adir.glob("*.png"))
+        self.assertEqual(len(png), 1)
+        self.assertEqual(png[0].read_bytes()[:8], PNG[:8])      # 진짜 PNG 서명
+        self.assertTrue(list(adir.glob("*.raw")))               # 원본 표본도 남는다
+        meta = json.loads((adir.parent / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(meta["structure"]["rebuilt_images"]), 1)

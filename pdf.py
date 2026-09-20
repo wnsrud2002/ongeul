@@ -7,6 +7,7 @@ xref 스트림 구현을 생략할 수 있어서다(같은 번호는 뒤에 나�
 """
 from __future__ import annotations
 
+import collections
 import re
 import struct
 import zlib
@@ -636,12 +637,17 @@ class Font:
         (Identity-H에서는 코드가 곧 글리프 번호다)."""
         if self._ttf is None:
             prog = embedded_font_file(self._doc, self._fd)
-            self._ttf = ttf_gid_to_unicode(prog) if prog else {}
+            if prog:
+                self._ttf = ttf_post_names(prog)          # 이름표를 먼저 깔고
+                self._ttf.update(ttf_gid_to_unicode(prog))  # cmap 결과로 덮어쓴다
+            else:
+                self._ttf = {}
         return self._ttf
 
-    def decode(self, raw: bytes) -> tuple[str, int, int]:
-        """(문자열, 코드 수, 매핑 실패 수)"""
-        out, n, bad = [], 0, 0
+    def decode(self, raw: bytes) -> tuple[str, int, list]:
+        """(문자열, 코드 수, 바꾸지 못한 코드 목록). 어떤 코드를 잃었는지 남겨야
+        사람이 원본과 대조할 수 있다."""
+        out, n, bad = [], 0, []
         step = 2 if self.two_byte else 1
         for i in range(0, len(raw) - (step - 1), step):
             code = raw[i] if step == 1 else (raw[i] << 8) | raw[i + 1]
@@ -690,6 +696,7 @@ class PageText:
         self.images: list = []
         self.no_font = 0
         self.fonts: set = set()
+        self.missing_codes: collections.Counter = collections.Counter()
 
 
 def extract_page(doc: Pdf, page: dict, limits_chars: int = 5_000_000) -> PageText:
@@ -734,11 +741,13 @@ def _run(doc: Pdf, content: bytes, res: dict, out: PageText, depth: int, cap: in
         if font is None:
             out.no_font += 1
             txt = raw.decode("latin-1", "replace")
-            n, bad = len(raw), 0
+            n, bad = len(raw), []
         else:
             txt, n, bad = font.decode(raw)
         out.codes += n
-        out.unmapped += bad
+        out.unmapped += len(bad)
+        for c in bad:
+            out.missing_codes[c] += 1
         emit(txt)
 
     while True:
@@ -901,6 +910,51 @@ def ttf_gid_to_unicode(data: bytes) -> dict[int, str]:
     return out
 
 
+MAC_GLYPHS = (".notdef .null nonmarkingreturn space exclam quotedbl numbersign dollar percent "
+              "ampersand quotesingle parenleft parenright asterisk plus comma hyphen period "
+              "slash zero one two three four five six seven eight nine colon semicolon less "
+              "equal greater question at A B C D E F G H I J K L M N O P Q R S T U V W X Y Z "
+              "bracketleft backslash bracketright asciicircum underscore grave a b c d e f g h "
+              "i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde").split()
+
+
+def ttf_post_names(data: bytes) -> dict[int, str]:
+    """post 테이블(2.0)의 글리프 이름 → 유니코드. cmap이 잘린 서브셋 폰트에서
+    'uniAC00' 같은 이름만 남아 있는 경우를 건진다."""
+    out: dict[int, str] = {}
+    try:
+        off = struct.unpack_from(">I", data, 12)[0] if data[:4] == b"ttcf" else 0
+        num = struct.unpack_from(">H", data, off + 4)[0]
+        post = None
+        for i in range(num):
+            rec = off + 12 + i * 16
+            if data[rec:rec + 4] == b"post":
+                post = struct.unpack_from(">II", data, rec + 8)
+                break
+        if not post:
+            return out
+        base, length = post
+        if struct.unpack_from(">I", data, base)[0] != 0x00020000:
+            return out
+        nglyphs = struct.unpack_from(">H", data, base + 32)[0]
+        idx = struct.unpack_from(">%dH" % nglyphs, data, base + 34)
+        names, i = [], base + 34 + nglyphs * 2
+        end = base + length
+        while i < end and i < len(data):
+            ln = data[i]
+            names.append(data[i + 1:i + 1 + ln].decode("latin-1", "replace"))
+            i += 1 + ln
+        for gid, k in enumerate(idx):
+            name = MAC_GLYPHS[k] if k < len(MAC_GLYPHS) else (
+                names[k - 258] if 258 <= k < 258 + len(names) else "")
+            ch = glyph_to_char(name) if name else None
+            if ch:
+                out[gid] = ch
+    except (struct.error, IndexError, ValueError):
+        return out
+    return out
+
+
 def embedded_font_file(doc: Pdf, fd: dict):
     """폰트 사전에서 내장 TrueType 프로그램(FontFile2)을 찾는다."""
     cand = [fd]
@@ -922,3 +976,105 @@ def embedded_font_file(doc: Pdf, fd: dict):
             except PdfError:
                 continue
     return None
+
+
+# ---------------------------------------------------------------- 이미지 복원
+def _cs_info(doc: Pdf, cs, depth: int = 0):
+    """색 공간 → (성분 수, 팔레트 bytes|None). PDF 이미지는 파일이 아니라 원시
+    표본이라 성분 수를 알아야 그림으로 되돌릴 수 있다."""
+    cs = doc.resolve(cs)
+    if isinstance(cs, (Name, str)):
+        return {"DeviceGray": 1, "CalGray": 1, "G": 1, "DeviceRGB": 3, "CalRGB": 3, "RGB": 3,
+                "DeviceCMYK": 4, "CMYK": 4}.get(str(cs), 1), None
+    if isinstance(cs, list) and cs:
+        head = str(doc.resolve(cs[0]))
+        if head in ("Indexed", "I") and len(cs) >= 4:
+            lut = doc.resolve(cs[3])
+            if isinstance(lut, Stream):
+                try:
+                    lut, img = decode_stream(lut, doc.resolve)
+                    if img:
+                        lut = b""
+                except PdfError:
+                    lut = b""
+            elif isinstance(lut, bytes):
+                lut = bytes(lut)
+            else:
+                lut = b""
+            base, _ = _cs_info(doc, cs[1], depth + 1)
+            return 1, (lut, base)
+        if head == "ICCBased" and len(cs) >= 2:
+            st = doc.resolve(cs[1])
+            n = doc.resolve(st.dict.get("N")) if isinstance(st, Stream) else 3
+            return int(n or 3), None
+        if head in ("DeviceN",) and len(cs) >= 2:
+            names = doc.resolve(cs[1])
+            return (len(names) if isinstance(names, list) else 1), None
+        if head in ("Separation",):
+            return 1, None
+        if depth < 4 and len(cs) >= 2:
+            return _cs_info(doc, cs[1], depth + 1)
+    return 1, None
+
+
+def image_to_png(doc: Pdf, st: Stream) -> bytes | None:
+    """PDF 이미지 XObject를 PNG 바이트로 되돌린다(Pillow 사용). 실패하면 None."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        data, img_filter = decode_stream(st, doc.resolve)
+    except PdfError:
+        return None
+    if img_filter in ("DCTDecode", "JPXDecode"):
+        return None                      # 이미 그림 파일이라 손댈 필요가 없다
+    if img_filter:
+        return None                      # CCITT/JBIG2는 여기서 풀지 않는다
+    w = doc.resolve(st.dict.get("Width")) or doc.resolve(st.dict.get("W"))
+    h = doc.resolve(st.dict.get("Height")) or doc.resolve(st.dict.get("H"))
+    bpc = doc.resolve(st.dict.get("BitsPerComponent")) or doc.resolve(st.dict.get("BPC")) or 8
+    mask = bool(doc.resolve(st.dict.get("ImageMask")) or doc.resolve(st.dict.get("IM")))
+    if not (isinstance(w, int) and isinstance(h, int) and 0 < w * h <= 80_000_000):
+        return None
+    if mask:
+        bpc = 1
+    ncomp, indexed = _cs_info(doc, st.dict.get("ColorSpace") or st.dict.get("CS"))
+    decode = doc.resolve(st.dict.get("Decode")) or doc.resolve(st.dict.get("D"))
+    try:
+        if bpc == 1:
+            rowbytes = (w * ncomp + 7) // 8
+            need = rowbytes * h
+            im = Image.frombytes("1", (w, h), data[:need].ljust(need, b"\xff"))
+            if isinstance(decode, list) and decode[:1] == [1] or mask:
+                from PIL import ImageOps
+                im = ImageOps.invert(im.convert("L")).convert("1")
+            if indexed and indexed[0]:
+                pass                      # 1비트 인덱스는 흑백으로 충분하다
+            im = im.convert("L")
+        elif bpc == 8:
+            if indexed is not None:
+                lut, base = indexed
+                need = w * h
+                im = Image.frombytes("P", (w, h), data[:need].ljust(need, b"\x00"))
+                pal = bytearray(lut[:768])
+                if base == 1:             # 회색 팔레트를 RGB로 펼친다
+                    pal = bytearray(b for v in lut[:256] for b in (v, v, v))
+                pal.extend(b"\x00" * (768 - len(pal)))
+                im.putpalette(bytes(pal))
+                im = im.convert("RGB")
+            else:
+                mode = {1: "L", 3: "RGB", 4: "CMYK"}.get(ncomp)
+                if not mode:
+                    return None
+                need = w * h * ncomp
+                im = Image.frombytes(mode, (w, h), data[:need].ljust(need, b"\x00"))
+                if mode == "CMYK":
+                    im = im.convert("RGB")
+        else:
+            return None
+        buf = __import__("io").BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue()
+    except (ValueError, OSError, IndexError):
+        return None

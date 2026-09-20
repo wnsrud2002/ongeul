@@ -55,7 +55,7 @@ class Limits:
     def __init__(self, max_bytes=512 * 1024 * 1024, max_zip_entries=20000,
                  max_unzipped=2 * 1024 * 1024 * 1024, max_xml_bytes=256 * 1024 * 1024,
                  max_cells=2_000_000, max_pages=5000, ocr_timeout=120,
-                 convert_timeout=180):
+                 convert_timeout=180, ocr_max_images=3):
         self.max_bytes = max_bytes
         self.max_zip_entries = max_zip_entries
         self.max_unzipped = max_unzipped
@@ -64,6 +64,7 @@ class Limits:
         self.max_pages = max_pages
         self.ocr_timeout = ocr_timeout
         self.convert_timeout = convert_timeout
+        self.ocr_max_images = ocr_max_images
 
 
 class Res:
@@ -2416,7 +2417,8 @@ def convert_pdf(path: Path, opts, limits: Limits) -> Res:
                "글자 좌표로 재구성한 것이라 자동으로 보존을 확정할 수 없다.")
     stats = {"codes": 0, "unmapped": 0, "chars": 0, "images": 0, "ocr_pages": 0,
              "empty_pages": 0}
-    page_meta = []
+    page_meta: list = []
+    rebuilt: list = []
     for i, page in enumerate(pages, 1):
         out.append("")
         out.append("## 페이지 %d" % i)
@@ -2439,12 +2441,33 @@ def convert_pdf(path: Path, opts, limits: Limits) -> Res:
         if pt.no_font:
             res.warn("%d쪽에 글꼴 지정 없이 그린 글자가 있다" % i)
             res.demote(UNVERIFIED)
-        assets = []
+        assets: list = []
+        sized: list = []
         for name, st in pt.images:
             data, ext = pdf.image_bytes(doc, st)
-            aname = "media/p%d_%s.%s" % (i, re.sub(r"\W+", "_", name), ext)
-            res.assets[aname] = data
-            assets.append(aname)
+            base = "media/p%d_%s" % (i, re.sub(r"\W+", "_", name))
+            if ext in ("raw", "bin", "tif", "jbig2"):
+                # PDF 안의 이미지는 파일이 아니라 원시 표본이라 그대로는 열리지 않는다.
+                # 원본 바이트는 그대로 두고, 볼 수 있는 PNG를 따로 만든다.
+                png = pdf.image_to_png(doc, st)
+                res.assets[base + "." + ext] = data
+                if png:
+                    res.assets[base + ".png"] = png
+                    assets.append(base + ".png")
+                    rebuilt.append({"page": i, "raw": base + "." + ext,
+                                    "png": base + ".png", "raw_sha256": sha256(data)})
+                else:
+                    assets.append(base + "." + ext)
+                    res.warn("%d쪽 이미지를 볼 수 있는 형식으로 되돌리지 못했다(%s). "
+                             "원본 바이트만 보존했다." % (i, ext))
+                    res.demote(UNVERIFIED)
+            else:
+                res.assets[base + "." + ext] = data
+                assets.append(base + "." + ext)
+            w = doc.resolve(st.dict.get("Width")) or doc.resolve(st.dict.get("W")) or 0
+            h = doc.resolve(st.dict.get("Height")) or doc.resolve(st.dict.get("H")) or 0
+            sized.append((int(w) * int(h) if isinstance(w, int) and isinstance(h, int) else 0,
+                          assets[-1]))
             stats["images"] += 1
         if text.strip():
             out.append(esc_block(text))
@@ -2460,8 +2483,15 @@ def convert_pdf(path: Path, opts, limits: Limits) -> Res:
         ocr_mode = getattr(opts, "ocr", "off")
         want_ocr = ocr_mode == "force" or (ocr_mode == "auto" and not text.strip() and assets)
         if want_ocr and assets:
+            # 스캔 문서는 한 쪽이 이미지 수백 개로 쪼개져 있기도 하다. 전부 돌리면
+            # 몇 시간이 걸리고 결과도 조각난다. 큰 것부터 정해진 개수만 읽는다.
+            picked = [a for _, a in sorted(sized, key=lambda x: -x[0])[:limits.ocr_max_images]]
+            if len(assets) > len(picked):
+                res.warn("%d쪽 이미지 %d개 중 큰 %d개만 OCR했다(나머지는 읽지 않음)"
+                         % (i, len(assets), len(picked)))
+                res.demote(UNVERIFIED)
             got = []
-            for aname in assets:
+            for aname in picked:
                 txt = run_ocr(res.assets[aname], aname.rsplit(".", 1)[-1],
                               getattr(opts, "ocr_lang", "kor+eng"), res, limits)
                 if txt and txt.strip():
@@ -2481,10 +2511,13 @@ def convert_pdf(path: Path, opts, limits: Limits) -> Res:
             out.extend(ann)
         page_meta.append({"page": i, "chars": len(text), "codes": pt.codes,
                           "unmapped": pt.unmapped, "images": assets,
-                          "fonts": sorted(pt.fonts)})
+                          "fonts": sorted(pt.fonts),
+                          "unmapped_codes": ["0x%04X×%d" % (c, n)
+                                             for c, n in pt.missing_codes.most_common(50)]})
 
     res.markdown = "\n\n".join(x for x in out if x != "") + "\n"
     res.meta = {"format": "pdf", "version": doc.version, "pages": page_meta, "stats": stats,
+                "rebuilt_images": rebuilt,
                 "note": "글자 위치로 줄을 나눈 결과다. 다단·표·수식의 원래 구조는 복원하지 않는다."}
     res.info["chars"] = len(res.markdown)
     verify_pdf(res, doc, pages, stats)
