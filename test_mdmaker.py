@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 
 import mdmaker as M
+import xls
 
 PNG = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
@@ -1658,8 +1659,10 @@ class TestAppBundle(Tmp):
         self.assertEqual(info["CFBundleName"], "온글")
         self.assertEqual(info["CFBundleExecutable"], "ongeul")
         self.assertTrue(info["NSHighResolutionCapable"])
-        for name in ("gui.py", "mdmaker.py", "hwp5.py", "pdf.py"):
-            self.assertTrue((app / "Contents" / "Resources" / "app" / name).exists(), name)
+        packed = {f.name for f in (app / "Contents" / "Resources" / "app").glob("*.py")}
+        here = {f.name for f in Path(__file__).resolve().parent.glob("*.py")
+                if not f.name.startswith("test_") and f.name != "build_app.py"}
+        self.assertEqual(packed, here)      # 새 모듈을 빠뜨리면 여기서 걸린다
         launcher = app / "Contents" / "MacOS" / "ongeul"
         self.assertTrue(os.access(launcher, os.X_OK))
         # 최소 환경에서도 파이썬을 찾아 창을 세울 수 있어야 한다
@@ -1856,3 +1859,53 @@ class TestXlsxVerification(Tmp):
         self.assertIn("시트 `매출` 의 `D4` 칸", md)
         meta = json.loads((self.out / "그림.xlsx.assets" / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["structure"]["image_anchors"]["매출"][0]["cell"], "D4")
+
+
+class TestLegacyXls(Tmp):
+    """구형 .xls: 중간 변환기를 믿지 않고 원본 BIFF 를 직접 읽어 대조한다."""
+
+    def setUp(self):
+        super().setUp()
+        if not M.soffice_path():
+            self.skipTest("LibreOffice 없음")
+        src = self.inp / "원본.xlsx"
+        make_xlsx(src)
+        import subprocess
+        tmp = self.d / "conv"
+        tmp.mkdir()
+        r = subprocess.run([M.soffice_path(), "--headless", "--norestore",
+                            "-env:UserInstallation=file://%s/profile" % tmp,
+                            "--convert-to", "xls", "--outdir", str(tmp), str(src)],
+                           capture_output=True, shell=False, timeout=180)
+        made = list(tmp.glob("*.xls"))
+        if r.returncode != 0 or not made:
+            self.skipTest("LibreOffice 가 .xls 를 만들지 못했다")
+        self.p = self.inp / "옛엑셀.xls"
+        self.p.write_bytes(made[0].read_bytes())
+        src.unlink()
+
+    def test_biff_reader_sees_original_strings(self):
+        raw = self.p.read_bytes()
+        strings = xls.sst_strings(raw)
+        self.assertIn("항목", strings)
+        self.assertIn("줄바꿈|파이프", strings)      # 특수문자도 그대로
+        self.assertIn("매출", xls.sheet_names(raw))
+
+    def test_converts_and_is_checked_against_the_original(self):
+        self.assertEqual(self.run_cli(self.p, "--out", self.out), 0)
+        md = self.md_of("옛엑셀.xls")
+        self.assertIn("항목", md)
+        self.assertIn("LibreOffice로 xlsx를 거쳐 변환했다", md)
+        self.assertIn("원본 문자열(.xls 직접 읽기)", md)
+        self.assertIn("원본 .xls 를 직접 읽어 글자", md)
+
+    def test_middle_conversion_loss_is_caught(self):
+        opts = argparse.Namespace(encoding=None, xlsx_table="auto", max_cells=10 ** 7,
+                                  ocr="off", ocr_lang="kor+eng")
+        good = M.convert(self.p, opts, M.Limits())
+        self.assertEqual(good.status, M.SUCCESS)
+        lossy = M.Res(self.p, "xls")
+        lossy.markdown = good.markdown.replace("항목", "")    # 중간 변환이 글자를 흘린 셈
+        M.verify_legacy_xls(lossy, self.p)
+        self.assertEqual(lossy.status, M.PARTIAL)
+        self.assertIn("중간 변환에서 원본 글자", " ".join(lossy.warnings))

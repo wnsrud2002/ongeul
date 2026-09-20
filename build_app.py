@@ -15,7 +15,13 @@ from pathlib import Path
 
 APP_NAME = "온글"
 BUNDLE_ID = "local.mdmaker.ongeul"
-SOURCES = ("gui.py", "mdmaker.py", "hwp5.py", "pdf.py")
+# 모듈을 손으로 나열하면 새로 추가한 것을 빠뜨린다(실제로 xls.py 를 빠뜨렸다).
+SKIP_SOURCES = ("build_app.py",)
+
+
+def sources(project: Path) -> list[Path]:
+    return sorted(p for p in project.glob("*.py")
+                  if p.name not in SKIP_SOURCES and not p.name.startswith("test_"))
 ICON_SIZES = (16, 32, 64, 128, 256, 512, 1024)
 KOREAN_FONTS = ("/System/Library/Fonts/AppleSDGothicNeo.ttc",
                 "/System/Library/Fonts/Supplemental/AppleGothic.ttf")
@@ -105,8 +111,8 @@ def build(project: Path, out_dir: Path) -> Path:
     (res / "app").mkdir(parents=True)
     macos.mkdir(parents=True)
 
-    for name in SOURCES:
-        shutil.copy2(project / name, res / "app" / name)
+    for f in sources(project):
+        shutil.copy2(f, res / "app" / f.name)
 
     icon_ok = make_icns(res / "ongeul.icns")
     info = {

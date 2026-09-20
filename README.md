@@ -54,7 +54,8 @@ python3 build_app.py && open dist/온글.app       # macOS 앱으로
 | `.pptx` | 지원 | 슬라이드 순서, 그룹 도형, 표, 발표자 노트, **차트에 저장된 수치** |
 | `.pdf` | 제한 지원 | 본문·이미지·주석·링크. 구조상 항상 `unverified`(아래 한계 참고) |
 | 이미지 | 제한 지원 | 원본 보존 + OCR(선택). OCR 결과는 항상 검수 전 상태 |
-| `.doc` `.xls` `.ppt` `.rtf` `.odt` | 제한 지원 | LibreOffice 경유. 중간 변환 손실은 대조 불가라 `unverified` 상한 |
+| `.xls` | 지원 | LibreOffice 경유 후, **원본 BIFF를 직접 읽어** 글자·시트를 대조한다 |
+| `.doc` `.ppt` `.rtf` `.odt` | 제한 지원 | LibreOffice 경유. 중간 변환 손실을 대조할 방법이 없어 `unverified` 상한 |
 
 ---
 
@@ -62,9 +63,9 @@ python3 build_app.py && open dist/온글.app       # macOS 앱으로
 
 ```
 실제 문서 526개 (본인 컴퓨터의 한글·오피스·PDF 파일)
-  success 262 · unverified 227 · partial 31 · unsupported 6 · 실패 0 · 예외 0
+  success 264 · unverified 227 · partial 31 · unsupported 4 · 실패 0 · 예외 0
 
-  .xlsx 81/81   .pptx 22/22   .hwpx 28/28   .hwp 94/96   .docx 33/34   .csv 4/4
+  .xlsx 81/81   .pptx 22/22   .hwpx 28/28   .xls 2/2   .hwp 94/96   .docx 33/34   .csv 4/4
   .pdf  222 unverified + 31 partial + 4 unsupported(암호화)
 
 success가 아닌 것의 사유는 전부 특정돼 있다
@@ -73,9 +74,8 @@ success가 아닌 것의 사유는 전부 특정돼 있다
     4  암호화된 PDF — 우회하지 않는다
     2  이미지 — 내용은 사람이 검수해야 확정된다
     3  글자도 이미지도 없는 순수 도형 — 생김새를 Markdown으로 표현할 수 없다
-    2  구형 .xls — LibreOffice 미설치
 
-테스트 97개 통과 (표준 unittest, 프레임워크 없음)
+테스트 100개 통과 (표준 unittest, 프레임워크 없음)
   — 그중 8개는 일부러 망가뜨린 결과가 success로 올라가지 않는지 보는 실패 검증이다
   — CI는 리눅스·macOS·윈도우 × 파이썬 3.11/3.12/3.13 = 9개 조합
 ```
@@ -143,6 +143,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 | `mdmaker.py` | 형식별 변환기, 보존 검사, CLI |
 | `hwp5.py` | HWP 5.x 저수준 리더 — CFB(OLE) 복합 파일과 레코드 스트림 |
 | `pdf.py` | PDF 저수준 리더 — 객체·스트림·필터·폰트 인코딩 |
+| `xls.py` | 구형 엑셀(BIFF8) 문자열·시트 이름 리더 — 중간 변환 대조용 |
 | `gui.py` | 창 화면 (tkinter). CLI와 같은 변환 경로를 쓴다 |
 | `build_app.py` | macOS `.app` 묶음 만들기 (iconutil + plistlib) |
 | `mdmaker.md` | 개발 가이드라인 (이 프로그램이 지켜야 할 규칙) |

@@ -25,12 +25,14 @@ import sys
 import tempfile
 import time
 import shutil
+import struct
 import subprocess
 import zipfile
 import xml.etree.ElementTree as ET
 
 import hwp5
 import pdf
+import xls
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -2812,6 +2814,37 @@ def soffice_path() -> str | None:
     return None
 
 
+def verify_legacy_xls(res: Res, src: Path) -> None:
+    """중간 변환기를 믿지 않는다. 원본 .xls 를 직접 읽어 글자와 시트를 대조한다."""
+    try:
+        raw = src.read_bytes()
+        strings = xls.sst_strings(raw)
+        sheets = xls.sheet_names(raw)
+    except (xls.XlsError, struct.error, ValueError, IndexError) as exc:
+        res.warn("원본 .xls 를 직접 읽지 못해 중간 변환을 대조하지 못했다: %s" % exc)
+        res.demote(UNVERIFIED)
+        return
+    if not strings and not sheets:
+        res.warn("원본 .xls 에서 대조할 글자를 찾지 못했다")
+        res.demote(UNVERIFIED)
+        return
+    norm = normalize_md(res.markdown)
+    lost = [t for t in strings if not present(t, res.markdown, norm)]
+    lost_sheets = [t for t in sheets if not present(t, res.markdown, norm)]
+    res.checks.append({"item": "원본 문자열(.xls 직접 읽기)", "count": len(strings),
+                       "missing": len(lost), "ok": not lost})
+    res.checks.append({"item": "원본 시트 이름", "count": len(sheets),
+                       "missing": len(lost_sheets), "ok": not lost_sheets})
+    if lost or lost_sheets:
+        res.demote(PARTIAL)
+        res.warn("중간 변환에서 원본 글자 %d개·시트 %d개가 사라졌다: %r"
+                 % (len(lost), len(lost_sheets), (lost + lost_sheets)[:5]))
+    else:
+        res.markdown += ("\n> 원본 .xls 를 직접 읽어 글자 %d개와 시트 %d개가 모두 결과에 "
+                         "있음을 확인했다. 셀 값·수식·표시 형식은 중간 파일 기준으로 "
+                         "검사했다.\n" % (len(strings), len(sheets)))
+
+
 def convert_legacy(path: Path, opts, limits: Limits) -> Res:
     """중간 변환기로 현재 형식으로 바꾼 뒤 기존 경로를 재사용한다.
     중간 변환의 손실은 대조할 수 없으므로 결과는 unverified를 넘지 않는다."""
@@ -2851,9 +2884,12 @@ def convert_legacy(path: Path, opts, limits: Limits) -> Res:
         inner.fmt = res.fmt
         inner.info["intermediate"] = "%s -> %s (LibreOffice)" % (ext, target)
         inner.markdown = inner.markdown.replace(made[0].name, path.name, 1)
-        inner.warn("LibreOffice로 %s를 거쳐 변환했다. 중간 변환에서 생긴 차이는 대조할 수 없다."
-                   % target)
-        inner.demote(UNVERIFIED)
+        inner.warn("LibreOffice로 %s를 거쳐 변환했다." % target)
+        if ext == ".xls":
+            verify_legacy_xls(inner, path)     # 원본을 직접 읽어 중간 변환을 대조한다
+        else:
+            inner.warn("중간 변환에서 생긴 차이를 대조할 방법이 없다")
+            inner.demote(UNVERIFIED)
         return inner
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
