@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """mdmaker 테스트. 표준 unittest만 쓰고, 샘플은 여기서 직접 만든다(사용자 문서 사용 금지)."""
+import argparse
 import base64
 import io
 import datetime
@@ -1543,3 +1544,88 @@ class TestPdfUnmappedGlyphs(Tmp):
                           .read_text(encoding="utf-8"))
         codes = meta["structure"]["pages"][0]["unmapped_codes"]
         self.assertEqual(sorted(codes), ["0x0011×1", "0x0022×1"])
+
+
+class TestGui(Tmp):
+    """창을 숨긴 채 실제 Tk 위젯으로 돌린다. 화면이 없으면 건너뛴다."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import tkinter as tk
+            import gui
+        except ImportError as exc:
+            self.skipTest("tkinter 없음: %s" % exc)
+        self.tk, self.gui = tk, gui
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest("화면 없음: %s" % exc)
+        self.root.withdraw()
+        self.app = gui.App(self.root)
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        super().tearDown()
+
+    def _drain_now(self):
+        import queue as q
+        items = []
+        while True:
+            try:
+                items.append(self.app.q.get_nowait())
+            except q.Empty:
+                break
+        for it in items:
+            if not (it.get("done") or it.get("stopped") or it.get("error")):
+                self.app._add(it)
+        self.app._summarize(final=True)
+        return items
+
+    def test_converts_through_same_path_as_cli(self):
+        (self.inp / "a.txt").write_text("가나다", encoding="utf-8")
+        (self.inp / "b.xyz").write_bytes(b"??")           # 미지원 형식
+        make_docx(self.inp / "c.docx")
+        opts = argparse.Namespace(out=str(self.out), recursive=True, overwrite=False,
+                                  reuse=False, encoding=None, xlsx_table="auto",
+                                  max_cells=2_000_000, ocr="off", ocr_lang="kor+eng",
+                                  split_chars=0)
+        files = M.collect(self.inp, self.out, True)
+        self.app._work(files, self.inp, self.out, opts, single=False)
+        self._drain_now()
+        rows = [self.app.tree.item(i)["values"] for i in self.app.tree.get_children()]
+        self.assertEqual(len(rows), 3)
+        got = {r[2]: r[0] for r in rows}
+        self.assertEqual(got["a.txt"], M.SUCCESS)
+        self.assertEqual(got["c.docx"], M.SUCCESS)
+        self.assertEqual(got["b.xyz"], M.UNSUPPORTED)
+        self.assertTrue((self.out / "a.txt.md").exists())
+
+    def test_summary_says_incomplete_when_not_all_verified(self):
+        (self.inp / "b.xyz").write_bytes(b"??")
+        opts = argparse.Namespace(out=str(self.out), recursive=True, overwrite=False,
+                                  reuse=False, encoding=None, xlsx_table="auto",
+                                  max_cells=2_000_000, ocr="off", ocr_lang="kor+eng",
+                                  split_chars=0)
+        self.app._work(M.collect(self.inp, self.out, True), self.inp, self.out, opts, False)
+        self._drain_now()
+        self.assertIn("success가 아닌 결과는 완료가 아니다", self.app.summary.get())
+
+    def test_status_labels_cover_every_status(self):
+        for st in (M.SUCCESS, M.PARTIAL, M.UNVERIFIED, M.FAILED, M.UNSUPPORTED,
+                   M.SKIPPED, "conflict"):
+            self.assertIn(st, self.gui.STATUS_TEXT)
+
+    def test_worker_error_is_surfaced_not_swallowed(self):
+        def boom(*a, **k):
+            raise RuntimeError("일부러 낸 오류")
+        saved, M.run_batch = M.run_batch, boom
+        try:
+            self.app._work([], self.inp, self.out, argparse.Namespace(max_cells=1), False)
+        finally:
+            M.run_batch = saved
+        items = self._drain_now()
+        self.assertTrue(any("일부러 낸 오류" in (i.get("error") or "") for i in items))

@@ -2918,6 +2918,74 @@ def check_options(files: list[Path], opts) -> str | None:
     return None
 
 
+def run_batch(files, root: Path, out_root: Path, opts, limits: Limits, single: bool = False):
+    """파일 하나를 끝낼 때마다 결과를 내보낸다. CLI와 GUI가 같은 경로를 쓰게 하려는 것이다.
+
+    yield: {"rel", "status", "target", "warnings", "elapsed"} — conflict면 status가
+    "conflict"이고 warnings에 이유가 들어간다."""
+    cache = load_cache(out_root) if opts.reuse else {}
+    new_cache = dict(cache)
+    for f in files:
+        rel = Path(f.name) if single else f.relative_to(root)
+        if f.suffix.lower() not in SUPPORTED:
+            yield {"rel": rel, "status": UNSUPPORTED, "target": None, "elapsed": 0.0,
+                   "warnings": ["아직 지원하지 않는 형식이다"]}
+            continue
+        key = str(rel)
+        if opts.reuse and cache_valid(cache.get(key, {}), f, out_root, opts):
+            yield {"rel": rel, "status": SKIPPED, "target": out_root / cache[key]["md"],
+                   "elapsed": 0.0,
+                   "warnings": ["내용·옵션·결과가 이전 성공과 같다(재검증 통과)"]}
+            continue
+        t0 = time.perf_counter()
+        try:
+            if f.stat().st_size > limits.max_bytes:
+                raise ValueError("파일 크기 한도 초과: %d바이트" % f.stat().st_size)
+            res = convert(f, opts, limits)
+        except Exception as exc:                      # 한 파일이 실패해도 나머지는 계속한다
+            res = Res(f, f.suffix.lower().lstrip("."))
+            res.status = FAILED
+            res.warn("%s: %s" % (type(exc).__name__, exc))
+        # 성능 비교에 필요한 조건을 결과와 함께 남긴다(가이드 11장).
+        res.info.update({"elapsed_sec": round(time.perf_counter() - t0, 3),
+                         "source_bytes": f.stat().st_size, "ocr": opts.ocr,
+                         "platform": platform.platform(),
+                         "python": sys.version.split()[0]})
+        target, conflict = write_result(res, f, root, out_root, opts,
+                                        ours=bool(opts.reuse and key in cache))
+        if conflict:
+            yield {"rel": rel, "status": "conflict", "target": target,
+                   "elapsed": res.info["elapsed_sec"], "warnings": [conflict]}
+            continue
+        if opts.reuse:
+            if res.status == SUCCESS:
+                adir = target.parent / (rel.name + ".assets")
+                assets = {}
+                for a in sorted(res.assets):
+                    f2 = adir / a
+                    if f2.exists():
+                        assets[str(f2.relative_to(out_root))] = sha256(f2.read_bytes())
+                new_cache[key] = {"source_sha256": sha256(f.read_bytes()),
+                                  "options": options_key(opts), "version": VERSION,
+                                  "check_version": CHECK_VERSION, "status": res.status,
+                                  "md": str(target.relative_to(out_root)),
+                                  "md_sha256": sha256(target.read_bytes()),
+                                  "assets": assets}
+            else:
+                new_cache.pop(key, None)
+        yield {"rel": rel, "status": res.status, "target": target,
+               "elapsed": res.info["elapsed_sec"], "warnings": list(res.warnings)}
+    if opts.reuse and new_cache != cache:
+        out_root.mkdir(parents=True, exist_ok=True)
+        cache_path(out_root).write_text(json.dumps(new_cache, ensure_ascii=False, indent=1),
+                                        encoding="utf-8")
+
+
+def exit_code(counts: dict) -> int:
+    """재검증을 통과한 재사용 결과(skipped)만 성공과 함께 센다."""
+    return 1 if sum(v for k, v in counts.items() if k not in (SUCCESS, SKIPPED)) else 0
+
+
 def peak_memory_mb() -> float:
     """이 실행의 최대 메모리. ru_maxrss 단위가 macOS는 바이트, 리눅스는 KB다."""
     try:
@@ -2971,72 +3039,19 @@ def main(argv=None) -> int:
         return 2
 
     counts: dict = {}
-    conflicts = 0
-    elapsed_total = [0.0]
-    cache = load_cache(out_root) if opts.reuse else {}
-    new_cache = dict(cache)
-    for f in files:
-        rel = f.relative_to(root) if src.is_dir() else Path(f.name)
-        if f.suffix.lower() not in SUPPORTED:
-            counts[UNSUPPORTED] = counts.get(UNSUPPORTED, 0) + 1
-            print("[unsupported] %s" % rel)
-            continue
-        key = str(rel)
-        if opts.reuse and cache_valid(cache.get(key, {}), f, out_root, opts):
-            counts[SKIPPED] = counts.get(SKIPPED, 0) + 1
-            print("[skipped] %s — 내용·옵션·결과가 이전 성공과 같다(재검증 통과)" % rel)
-            continue
-        t0 = time.perf_counter()
-        try:
-            if f.stat().st_size > limits.max_bytes:
-                raise ValueError("파일 크기 한도 초과: %d바이트" % f.stat().st_size)
-            res = convert(f, opts, limits)
-        except Exception as exc:                      # 한 파일이 실패해도 나머지는 계속한다
-            res = Res(f, f.suffix.lower().lstrip("."))
-            res.status = FAILED
-            res.warn("%s: %s" % (type(exc).__name__, exc))
-        # 성능 비교에 필요한 조건을 결과와 함께 남긴다(가이드 11장).
-        res.info.update({"elapsed_sec": round(time.perf_counter() - t0, 3),
-                         "source_bytes": f.stat().st_size, "ocr": opts.ocr,
-                         "platform": platform.platform(),
-                         "python": sys.version.split()[0]})
-        elapsed_total[0] += res.info["elapsed_sec"]
-        target, conflict = write_result(res, f, root, out_root, opts,
-                                        ours=bool(opts.reuse and key in cache))
-        if conflict:
-            conflicts += 1
-            print("[conflict] %s — %s" % (rel, conflict))
-            continue
-        counts[res.status] = counts.get(res.status, 0) + 1
-        if opts.reuse:
-            if res.status == SUCCESS:
-                adir = target.parent / (rel.name + ".assets")
-                assets = {}
-                for a in sorted(res.assets):
-                    f2 = adir / a
-                    if f2.exists():
-                        assets[str(f2.relative_to(out_root))] = sha256(f2.read_bytes())
-                new_cache[key] = {"source_sha256": sha256(f.read_bytes()),
-                                  "options": options_key(opts), "version": VERSION,
-                                  "check_version": CHECK_VERSION, "status": res.status,
-                                  "md": str(target.relative_to(out_root)),
-                                  "md_sha256": sha256(target.read_bytes()),
-                                  "assets": assets}
-            else:
-                new_cache.pop(key, None)
-        note = (" — " + "; ".join(res.warnings[:2])) if res.warnings else ""
-        print("[%s] %s -> %s%s" % (res.status, rel, target, note))
+    elapsed_total = 0.0
+    for item in run_batch(files, root, out_root, opts, limits, single=not src.is_dir()):
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+        elapsed_total += item["elapsed"]
+        note = (" — " + "; ".join(item["warnings"][:2])) if item["warnings"] else ""
+        if item["target"] is None:
+            print("[%s] %s%s" % (item["status"], item["rel"], note))
+        else:
+            print("[%s] %s -> %s%s" % (item["status"], item["rel"], item["target"], note))
 
-    if opts.reuse and new_cache != cache:
-        out_root.mkdir(parents=True, exist_ok=True)
-        cache_path(out_root).write_text(json.dumps(new_cache, ensure_ascii=False, indent=1),
-                                        encoding="utf-8")
-    print("\n처리 시간 %.1f초 · 최대 메모리 %.0fMB" % (elapsed_total[0], peak_memory_mb()))
-    print("요약: " + ", ".join("%s %d" % (k, v) for k, v in sorted(counts.items()))
-          + (", conflict %d" % conflicts if conflicts else ""))
-    # 재검증을 통과한 재사용 결과(skipped)만 성공과 함께 센다.
-    incomplete = conflicts + sum(v for k, v in counts.items() if k not in (SUCCESS, SKIPPED))
-    return 1 if incomplete else 0
+    print("\n처리 시간 %.1f초 · 최대 메모리 %.0fMB" % (elapsed_total, peak_memory_mb()))
+    print("요약: " + ", ".join("%s %d" % (k, v) for k, v in sorted(counts.items())))
+    return exit_code(counts)
 
 
 if __name__ == "__main__":
