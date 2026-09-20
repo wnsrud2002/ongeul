@@ -1343,3 +1343,71 @@ class TestPptxRealWorld(Tmp):
                 o.writestr(n, d)
         self.assertEqual(self.run_cli(p, "--out", self.out), 1)
         self.assertIn("본문 위치를 확인하지 못한 자산", self.md_of("차트발표.pptx", incomplete=True))
+
+
+class TestOffline(Tmp):
+    """네트워크를 막은 상태에서 모든 지원 경로가 도는지 본다(가이드 3장·11장).
+    외부 링크가 들어 있는 문서도 조회 없이 처리해야 한다."""
+
+    def setUp(self):
+        super().setUp()
+        import socket
+        import urllib.request          # ssl이 socket을 상속하므로 패치 전에 먼저 읽어 둔다
+        self.urllib = urllib.request
+        self.calls = []
+
+        def deny(*a, **k):
+            self.calls.append(a[:1])
+            raise OSError("네트워크 사용 금지(오프라인 검증)")
+
+        self._saved = {}
+        for mod, name in ((socket, "socket"), (socket, "create_connection"),
+                          (socket, "getaddrinfo"), (socket, "gethostbyname")):
+            self._saved[name] = getattr(mod, name)
+            setattr(mod, name, deny)
+        self._saved["urlopen"] = self.urllib.urlopen
+        self.urllib.urlopen = deny
+
+    def tearDown(self):
+        import socket, urllib.request
+        for name, fn in self._saved.items():
+            setattr(urllib.request if name == "urlopen" else socket, name, fn)
+        super().tearDown()
+
+    def test_every_format_converts_without_network(self):
+        make_docx(self.inp / "a.docx")          # 외부 하이퍼링크·이미지 포함
+        make_xlsx(self.inp / "b.xlsx")
+        make_hwp(self.inp / "c.hwp")
+        make_hwpx(self.inp / "d.hwpx")
+        make_pptx(self.inp / "e.pptx")
+        make_pdf(self.inp / "f.pdf")            # 외부 URI 주석 포함
+        (self.inp / "g.txt").write_text("가나다", encoding="utf-8")
+        (self.inp / "h.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+        (self.inp / "i.png").write_bytes(PNG)
+        self.run_cli(self.inp, "--out", self.out, "--recursive")
+        made = sorted(p.name for p in list(self.out.rglob("*.md")))
+        self.assertEqual(len(made), 9, made)
+        self.assertEqual(self.calls, [])        # 네트워크를 한 번도 건드리지 않는다
+
+    def test_external_link_is_kept_but_not_fetched(self):
+        make_docx(self.inp / "a.docx")
+        self.assertEqual(self.run_cli(self.inp / "a.docx", "--out", self.out), 0)
+        self.assertIn("https://example.invalid/a", self.md_of("a.docx"))
+        self.assertEqual(self.calls, [])
+
+    def test_url_input_still_rejected_offline(self):
+        self.assertEqual(self.run_cli("https://example.invalid/a.docx", "--out", self.out), 2)
+        self.assertEqual(self.calls, [])
+
+
+class TestRunInfo(Tmp):
+    def test_processing_info_recorded(self):
+        p = self.inp / "a.txt"
+        p.write_text("가나다", encoding="utf-8")
+        self.run_cli(p, "--out", self.out)
+        meta = json.loads((self.out / "a.txt.assets" / "meta.json").read_text(encoding="utf-8"))
+        info = meta["info"]
+        for k in ("elapsed_sec", "source_bytes", "ocr", "platform", "python",
+                  "converter", "check_version", "chars"):
+            self.assertIn(k, info)
+        self.assertEqual(info["source_bytes"], p.stat().st_size)

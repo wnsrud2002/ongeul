@@ -15,9 +15,11 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import sys
 import tempfile
+import time
 import shutil
 import subprocess
 import zipfile
@@ -2789,12 +2791,14 @@ def cache_valid(entry: dict, src: Path, out_root: Path, opts) -> bool:
     return True
 
 
-def write_result(res: Res, src: Path, root: Path, out_root: Path, opts) -> tuple[Path, str | None]:
+def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
+                 ours: bool = False) -> tuple[Path, str | None]:
     rel = src.relative_to(root) if root != src else Path(src.name)
     base = out_root if res.status == SUCCESS else out_root / "_incomplete"
     target = base / rel.parent / (rel.name + ".md")
     assets_dir = base / rel.parent / (rel.name + ".assets")
-    if not opts.overwrite and (target.exists() or assets_dir.exists()):
+    # ours=True는 재사용 기록에 남아 있는, 우리가 만든 결과라는 뜻이다.
+    if not (opts.overwrite or ours) and (target.exists() or assets_dir.exists()):
         return target, "출력이 이미 있다 (--overwrite 없이는 덮어쓰지 않는다): %s" % target
     target.parent.mkdir(parents=True, exist_ok=True)
     # 중간 실패로 기존 결과를 훼손하지 않도록 임시 위치에 묶음을 만든 뒤 옮긴다.
@@ -2816,7 +2820,7 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts) -> tuple
                 (tmp / fn).write_text(head + part, encoding="utf-8", newline="\n")
                 made_parts.append(tmp / fn)
         (tmp / "doc.md").write_text(res.markdown + status_section(res), encoding="utf-8", newline="\n")
-        if res.assets or res.meta:
+        if True:              # 보조 폴더는 언제나 만든다. meta.json이 보존 검사 기록이다.
             adir = tmp / "assets"
             adir.mkdir()
             listing = []
@@ -2870,6 +2874,16 @@ def check_options(files: list[Path], opts) -> str | None:
     return None
 
 
+def peak_memory_mb() -> float:
+    """이 실행의 최대 메모리. ru_maxrss 단위가 macOS는 바이트, 리눅스는 KB다."""
+    try:
+        import resource
+        v = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, OSError):
+        return 0.0
+    return v / (1024 * 1024) if sys.platform == "darwin" else v / 1024
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="로컬 문서를 완전 보존 기준으로 Markdown으로 변환한다 (외부 API 없음)")
@@ -2914,6 +2928,7 @@ def main(argv=None) -> int:
 
     counts: dict = {}
     conflicts = 0
+    elapsed_total = [0.0]
     cache = load_cache(out_root) if opts.reuse else {}
     new_cache = dict(cache)
     for f in files:
@@ -2927,6 +2942,7 @@ def main(argv=None) -> int:
             counts[SKIPPED] = counts.get(SKIPPED, 0) + 1
             print("[skipped] %s — 내용·옵션·결과가 이전 성공과 같다(재검증 통과)" % rel)
             continue
+        t0 = time.perf_counter()
         try:
             if f.stat().st_size > limits.max_bytes:
                 raise ValueError("파일 크기 한도 초과: %d바이트" % f.stat().st_size)
@@ -2935,7 +2951,14 @@ def main(argv=None) -> int:
             res = Res(f, f.suffix.lower().lstrip("."))
             res.status = FAILED
             res.warn("%s: %s" % (type(exc).__name__, exc))
-        target, conflict = write_result(res, f, root, out_root, opts)
+        # 성능 비교에 필요한 조건을 결과와 함께 남긴다(가이드 11장).
+        res.info.update({"elapsed_sec": round(time.perf_counter() - t0, 3),
+                         "source_bytes": f.stat().st_size, "ocr": opts.ocr,
+                         "platform": platform.platform(),
+                         "python": sys.version.split()[0]})
+        elapsed_total[0] += res.info["elapsed_sec"]
+        target, conflict = write_result(res, f, root, out_root, opts,
+                                        ours=bool(opts.reuse and key in cache))
         if conflict:
             conflicts += 1
             print("[conflict] %s — %s" % (rel, conflict))
@@ -2964,7 +2987,8 @@ def main(argv=None) -> int:
         out_root.mkdir(parents=True, exist_ok=True)
         cache_path(out_root).write_text(json.dumps(new_cache, ensure_ascii=False, indent=1),
                                         encoding="utf-8")
-    print("\n요약: " + ", ".join("%s %d" % (k, v) for k, v in sorted(counts.items()))
+    print("\n처리 시간 %.1f초 · 최대 메모리 %.0fMB" % (elapsed_total[0], peak_memory_mb()))
+    print("요약: " + ", ".join("%s %d" % (k, v) for k, v in sorted(counts.items()))
           + (", conflict %d" % conflicts if conflicts else ""))
     # 재검증을 통과한 재사용 결과(skipped)만 성공과 함께 센다.
     incomplete = conflicts + sum(v for k, v in counts.items() if k not in (SUCCESS, SKIPPED))
