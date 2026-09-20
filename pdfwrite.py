@@ -349,13 +349,14 @@ class Writer:
     # -- 글자 --
     def width(self, s: str, size: float) -> float:
         f = self.font
-        return sum(f.width1000(f.gid(c)) for c in s) * size / 1000.0
+        s = s.replace("\t", "    ")
+        return sum(f.width1000(f.gid(c)) for c in s if ord(c) >= 32) * size / 1000.0
 
     def _hex(self, s: str) -> str:
         out = []
         for c in s:
             g = self.font.gid(c)
-            if g == 0 and not c.isspace():
+            if g == 0 and not c.isspace() and ord(c) >= 32:
                 self.missing[c] = self.missing.get(c, 0) + 1   # 빈 네모로 그려질 글자
             else:
                 self.used.setdefault(g, c)
@@ -363,7 +364,10 @@ class Writer:
         return "".join(out)
 
     def draw(self, s: str, x: float, y: float, size: float, bold=False, gray=0.0) -> None:
-        if not s:
+        # 탭·제어문자는 글꼴에 글리프가 없어 빈 네모로 그려진다. 빈칸으로 바꾼다.
+        s = s.replace("\t", "    ")
+        s = "".join(" " if ord(c) < 32 else c for c in s)
+        if not s.strip():
             return
         mode = "2 Tr 0.3 w" if bold else "0 Tr"
         self.ops.append("q %s %s BT /F1 %.2f Tf %.2f %.2f Td <%s> Tj ET Q"
@@ -385,14 +389,24 @@ class Writer:
     def end_page(self) -> None:
         if not self.ops:
             return
-        n = len(self.pages) + 1
-        label = "%d" % n
-        self.ops.append("q 0.5 g BT /F1 8.5 Tf %.2f %.2f Td <%s> Tj ET Q"
-                        % (A4[0] / 2 - self.width(label, 8.5) / 2, 28, self._hex(label)))
         cs = self.doc.stream("", "\n".join(self.ops).encode("latin-1"))
         self.pages.append(cs)
         self.ops = []
         self.y = A4[1] - 60.0
+
+    def _furniture(self, index: int, total: int) -> int:
+        """머리글과 쪽번호. 전체 쪽수를 알아야 해서 마지막에 따로 그린다."""
+        ops = []
+        label = "%d / %d" % (index + 1, total)
+        ops.append("q 0.45 g BT /F1 8.5 Tf %.2f %.2f Td <%s> Tj ET Q"
+                   % (A4[0] / 2 - self.width(label, 8.5) / 2, 28, self._hex(label)))
+        if index > 0 and self.title:
+            head = self.title if self.width(self.title, 8) < self.w else self.title[:40] + "…"
+            ops.append("q 0.55 g BT /F1 8 Tf %.2f %.2f Td <%s> Tj ET Q"
+                       % (self.x0, A4[1] - 38, self._hex(head)))
+            ops.append("q 0.88 G 0.5 w %.2f %.2f m %.2f %.2f l S Q"
+                       % (self.x0, A4[1] - 44, self.x0 + self.w, A4[1] - 44))
+        return self.doc.stream("", "\n".join(ops).encode("latin-1"))
 
     # -- 블록 --
     def wrap(self, text: str, size: float, width: float) -> list[str]:
@@ -425,7 +439,8 @@ class Writer:
 
     def heading(self, level: int, text: str) -> None:
         size = SIZES.get(level, 11)
-        self.need(size * 2.4)
+        # 제목만 쪽 끝에 덩그러니 남지 않게 뒤따를 두 줄 자리까지 본다
+        self.need(size * 2.4 + BODY * LEADING * 2)
         self.y -= size * 0.7
         self.paragraph(text, size=size, bold=level <= 2)
         if level <= 2:
@@ -459,20 +474,28 @@ class Writer:
         size = 8.8
         cols = max(len(r) for r in rows)
         colw = self.w / cols
+        header = rows[0] if rows else []
+        page_at_start = len(self.pages)
         for ri, row in enumerate(rows):
-            cells = [self.wrap(c, size, colw - 8) for c in row] + [[""]] * (cols - len(row))
-            h = max(len(c) for c in cells) * size * 1.3 + 6
-            self.need(h)
-            top = self.y + size
-            for ci, lines in enumerate(cells):
-                x = self.x0 + ci * colw
-                self.box(x, top - h, colw, h, fill=(0.94, 0.94, 0.96) if ri == 0 else None)
-                yy = self.y
-                for line in lines:
-                    self.draw(line, x + 4, yy, size, bold=(ri == 0))
-                    yy -= size * 1.3
-            self.y = top - h - size * 0.2
+            if ri and len(self.pages) != page_at_start:
+                page_at_start = len(self.pages)
+                self._table_row(header, cols, colw, size, is_header=True)
+            self._table_row(row, cols, colw, size, is_header=(ri == 0))
         self.y -= 6
+
+    def _table_row(self, row, cols, colw, size, is_header=False) -> None:
+        cells = [self.wrap(c, size, colw - 8) for c in row] + [[""]] * (cols - len(row))
+        h = max(len(c) for c in cells) * size * 1.3 + 6
+        self.need(h)
+        top = self.y + size
+        for ci, lines in enumerate(cells):
+            x = self.x0 + ci * colw
+            self.box(x, top - h, colw, h, fill=(0.94, 0.94, 0.96) if is_header else None)
+            yy = self.y
+            for line in lines:
+                self.draw(line, x + 4, yy, size, bold=is_header)
+                yy -= size * 1.3
+        self.y = top - h - size * 0.2
 
     def image(self, path, alt: str) -> None:
         info = load_image(path)
@@ -506,21 +529,52 @@ class Writer:
         if alt:
             self.paragraph(alt, size=8.5, gray=0.45)
 
+    # -- 변환 상태 (사람이 읽는 형태) --
+    def summary_block(self, summary: dict) -> None:
+        if not summary:
+            return
+        self.y -= 10
+        self.need(90)
+        self.rule(self.y + 6, self.x0, self.x0 + self.w, gray=0.8)
+        self.y -= 6
+        self.paragraph("변환 상태", size=13, bold=True)
+        ok = summary.get("status") == "success"
+        badge = summary.get("label") or summary.get("status", "")
+        pad = 5
+        tw = self.width(badge, 9.5)
+        self.need(20)
+        fill = (0.90, 0.95, 0.90) if ok else (0.99, 0.94, 0.88)
+        self.ops.append("q %.3f %.3f %.3f rg %.2f %.2f %.2f %.2f re f Q"
+                        % (*fill, self.x0, self.y - 4, tw + pad * 2, 16))
+        self.draw(badge, self.x0 + pad, self.y, 9.5, gray=0.1)
+        self.y -= 24
+        rows = summary.get("rows") or []
+        if rows:
+            self.table([["검사 항목", "결과"]] + rows)
+        for w in summary.get("warnings", []):
+            self.paragraph("• " + w, size=9, indent=6, gray=0.25)
+        note = summary.get("note")
+        if note:
+            self.y -= 4
+            self.paragraph(note, size=8.5, gray=0.45)
+
     # -- 마무리 --
     def save(self) -> bytes:
         self.end_page()
         if not self.pages:
             self.ops.append("")
             self.end_page()
+        furniture = [self._furniture(i, len(self.pages)) for i in range(len(self.pages))]
         font_ref = embed_font(self.doc, self.font, self.used or {0: ""}, "OngeulSubset")
         xobj = " ".join("/I%d %d 0 R" % (r, r) for r, _w, _h in self.images.values())
         parent = self.doc.reserve()
         kids = []
-        for cs in self.pages:
+        for i, cs in enumerate(self.pages):
             kids.append(self.doc.add(
-                ("<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2f %.2f] /Contents %d 0 R"
+                ("<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2f %.2f]"
+                 " /Contents [%d 0 R %d 0 R]"
                  " /Resources << /Font << /F1 %d 0 R >> /XObject << %s >> >> >>"
-                 % (parent, A4[0], A4[1], cs, font_ref, xobj)).encode("latin-1")))
+                 % (parent, A4[0], A4[1], cs, furniture[i], font_ref, xobj)).encode("latin-1")))
         self.doc.set(parent, ("<< /Type /Pages /Kids [%s] /Count %d >>"
                               % (" ".join("%d 0 R" % k for k in kids), len(kids))).encode())
         root = self.doc.add(("<< /Type /Catalog /Pages %d 0 R >>" % parent).encode())
@@ -616,7 +670,7 @@ def find_font(explicit: str | None = None, sample: str = ""):
 
 
 def render_markdown(md: str, font: TtfFont, title: str, base_dir=None,
-                    report: dict | None = None) -> bytes:
+                    report: dict | None = None, summary: dict | None = None) -> bytes:
     """온글이 만든 Markdown 을 PDF 로 그린다. 우리가 쓰는 표기만 다룬다.
     report 를 주면 글꼴에 없어 못 그린 글자를 담아 돌려준다."""
     import re
@@ -627,6 +681,12 @@ def render_markdown(md: str, font: TtfFont, title: str, base_dir=None,
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
+        if stripped.startswith("<!--"):        # 기계용 메모는 읽는 사람에게 필요 없다
+            w.y -= 2
+            w.rule(w.y, w.x0, w.x0 + w.w, gray=0.9)
+            w.y -= 8
+            i += 1
+            continue
         if stripped.startswith("```"):
             j = i + 1
             block = []
@@ -687,6 +747,7 @@ def render_markdown(md: str, font: TtfFont, title: str, base_dir=None,
             continue
         w.paragraph(plain(line))
         i += 1
+    w.summary_block(summary or {})
     out = w.save()
     if report is not None:
         report["missing_chars"] = dict(sorted(w.missing.items(), key=lambda kv: -kv[1])[:20])

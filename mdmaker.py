@@ -3131,6 +3131,29 @@ def verify_made_pdf(path: Path, md: str, sample: int = 400) -> tuple[int, int, i
     return len(pages), min(checked, sample), missing
 
 
+def pdf_summary(res: Res) -> dict:
+    """PDF에 넣을 사람용 변환 상태. 기록 전체는 .md 와 meta.json 에 있다."""
+    labels = (("count", "검사"), ("chars", "문자"), ("codes", "글자코드"),
+              ("stream_bytes", "원본코드"), ("pages", "쪽"), ("missing", "누락"),
+              ("mismatch", "불일치"), ("unmapped", "대응실패"), ("empty", "빈쪽"),
+              ("orphan", "미참조"), ("saved", "보존"), ("parts", "조각"),
+              ("shared_formula", "공유수식"), ("limit", "한도"))
+    rows = []
+    for c in res.checks:
+        bits = ["%s %s" % (label, c[key]) for key, label in labels if key in c]
+        if not bits:      # 모르는 항목이라도 숫자는 보여준다
+            bits = ["%s %s" % (k, v) for k, v in c.items()
+                    if k not in ("item", "ok", "note") and isinstance(v, (int, float))]
+        note = c.get("note")
+        rows.append([str(c.get("item", "")), "%s — %s%s"
+                     % (" · ".join(bits) or "-", "통과" if c.get("ok") else "확인 필요",
+                        (" (%s)" % note) if note else "")])
+    return {"status": res.status, "label": STATUS_LABEL.get(res.status, res.status),
+            "rows": rows, "warnings": [w for w in res.warnings],
+            "note": "이 PDF는 읽기용 산출물이다. 보존을 보장하는 것은 같은 이름의 .md 와 "
+                    ".assets 폴더이며, 검사 기록 전체는 meta.json 에 있다."}
+
+
 def _pdf_is_garbage(checked: int, missing: int) -> bool:
     """만든 PDF가 원본과 너무 다르면 쓸 수 없는 것이다. 그럴듯한 쓰레기를 남기지 않는다."""
     return checked >= 4 and (missing < 0 or missing / float(checked) > 0.5)
@@ -3171,14 +3194,16 @@ def make_pdfs(res: Res, src: Path, target: Path, assets_dir: Path, opts, limits:
                 res.warn("결과 PDF를 만들지 못했다: %s" % err)
                 return []
         else:
-            body = res.markdown + status_section(res)
-            font, why = pdfwrite.find_font(getattr(opts, "pdf_font", None), sample=body)
+            body = res.markdown
+            font, why = pdfwrite.find_font(getattr(opts, "pdf_font", None),
+                                           sample=body + status_section(res))
             if font is None:
                 res.warn("결과 PDF를 만들지 못했다: %s. --pdf-font 로 글꼴을 지정할 수 있다." % why)
                 return []
             try:
                 out_pdf.write_bytes(pdfwrite.render_markdown(
-                    body, font, src.name, base_dir=assets_dir, report=report))
+                    body, font, src.name, base_dir=assets_dir, report=report,
+                    summary=pdf_summary(res)))
             except (pdfwrite.FontError, OSError, ValueError, struct.error) as exc:
                 res.warn("결과 PDF를 만들지 못했다: %s: %s" % (type(exc).__name__, exc))
                 return []

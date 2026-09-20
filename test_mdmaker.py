@@ -2046,8 +2046,9 @@ class TestPdfExport(Tmp):
         """PDF에 본문이 빠지면 경고한다. Markdown 자체는 영향받지 않는다."""
         make_docx(self.inp / "b.docx")
         saved = pdfwrite.render_markdown
-        pdfwrite.render_markdown = lambda md, font, title, base_dir=None, report=None: saved(
-            "# 제목만 남긴다", font, title, base_dir, report)
+        pdfwrite.render_markdown = (
+            lambda md, font, title, base_dir=None, report=None, summary=None:
+            saved("# 제목만 남긴다", font, title, base_dir, report, summary))
         try:
             code = self.run_cli(self.inp / "b.docx", "--out", self.out, "--pdf", "result")
         finally:
@@ -2080,3 +2081,48 @@ class TestPdfFontCoverage(Tmp):
         report = {}
         pdfwrite.render_markdown("보통 글자\n\n\ue000\ue001 사용자 영역", font, "x", report=report)
         self.assertGreaterEqual(report["missing_total"], 2)   # 글꼴에 없는 글자를 센다
+
+
+class TestPdfReadability(Tmp):
+    """PDF는 읽기용 산출물이다. 기계용 표기가 아니라 사람이 읽는 형태여야 한다."""
+
+    def setUp(self):
+        super().setUp()
+        if pdfwrite.find_font(sample=KOREAN_PROBE)[0] is None:
+            self.skipTest("한글을 그릴 글꼴이 없다")
+        self.p = self.inp / "보고서.hwpx"
+        make_hwpx(self.p)
+        self.assertEqual(self.run_cli(self.p, "--out", self.out, "--pdf", "result"), 0)
+        doc = pdf.Pdf((self.out / "보고서.hwpx.pdf").read_bytes())
+        self.pages = doc.pages()
+        self.text = ["".join(pdf.extract_page(doc, p).parts) for p in self.pages]
+        self.all = "".join(self.text)
+
+    def test_status_is_human_readable_not_json(self):
+        self.assertIn("변환 상태", self.all)
+        self.assertIn("전체 보존 검증 통과", self.all)
+        self.assertIn("검사 항목", self.all)
+        self.assertNotIn('{"item"', self.all)          # 날것의 JSON 을 보여주지 않는다
+        self.assertNotIn('"ok": true', self.all)
+
+    def test_says_what_the_pdf_is_for(self):
+        self.assertIn("읽기용 산출물", self.all)
+        self.assertIn("meta.json", self.all)           # 기록이 어디 있는지 알려준다
+
+    def test_machine_comments_are_not_drawn(self):
+        self.assertNotIn("<!--", self.all)
+        self.assertNotIn("Contents/section", self.all)  # 구역 파일 이름은 기계용이다
+
+    def test_page_number_shows_total(self):
+        self.assertIn("1 / %d" % len(self.pages), self.all)
+
+    def test_running_header_after_first_page(self):
+        if len(self.pages) < 2:
+            self.skipTest("한 쪽짜리")
+        self.assertIn("보고서.hwpx", self.text[1])      # 둘째 쪽부터 문서 이름을 달고 다닌다
+
+    def test_control_characters_are_not_drawn_as_boxes(self):
+        report = {}
+        font, _ = pdfwrite.find_font(sample=KOREAN_PROBE)
+        pdfwrite.render_markdown("앞\t뒤\x0b가운데", font, "x", report=report)
+        self.assertEqual(report["missing_total"], 0)   # 탭·제어문자를 글리프로 찾지 않는다
