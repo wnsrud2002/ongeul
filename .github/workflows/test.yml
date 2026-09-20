@@ -1,0 +1,57 @@
+name: 테스트
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 엑셀 변환에 필요한 것과, PDF 이미지 복원에 쓰는 것. 나머지는 표준 라이브러리다.
+      - name: 의존성 설치
+        run: python -m pip install --upgrade pip openpyxl pillow
+
+      # 창 화면 테스트는 화면이 없으면 스스로 건너뛴다. 리눅스에선 tkinter 자체가 없을 수 있다.
+      - name: tkinter 설치 (리눅스)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: 테스트
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+
+      - name: 실제로 변환되는지 (합성 샘플 한 바퀴)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from pathlib import Path
+          from test_mdmaker import make_docx, make_xlsx, make_hwp, make_hwpx, make_pptx, make_pdf, PNG
+          d = Path("_smoke/in"); d.mkdir(parents=True)
+          make_docx(d / "a.docx"); make_xlsx(d / "b.xlsx"); make_hwp(d / "c.hwp")
+          make_hwpx(d / "d.hwpx"); make_pptx(d / "e.pptx"); make_pdf(d / "f.pdf")
+          (d / "g.txt").write_text("가나다", encoding="utf-8")
+          (d / "h.png").write_bytes(PNG)
+          PY
+          # PDF·이미지는 설계상 unverified라 종료 코드 1이 정상이다
+          python mdmaker.py _smoke/in --out _smoke/out --recursive || true
+          test -f "_smoke/out/a.docx.md"
+          test -f "_smoke/out/c.hwp.md"
+          test -f "_smoke/out/_incomplete/f.pdf.md"
+          grep -q "전체 보존 검증 통과" "_smoke/out/a.docx.md"

@@ -1,5 +1,7 @@
 # 온글 (Ongeul)
 
+[![테스트](https://github.com/wnsrud2002/ongeul/actions/workflows/test.yml/badge.svg)](https://github.com/wnsrud2002/ongeul/actions/workflows/test.yml)
+
 한글·오피스·PDF 문서를 **로컬에서** Markdown으로 바꾼다. 이름은 *온전한 글* — 이 프로그램이 약속하는 유일한 것이다.
 
 문서를 AI에 넣기 전에 미리 텍스트로 뽑아두는 용도다. 변환 과정에서 외부로 나가는 것은 없다.
@@ -65,7 +67,8 @@ python3 build_app.py && open dist/온글.app       # macOS 앱으로
   .docx 33/34   .hwp 90/96   .hwpx 27/28   .xlsx 71/81   .pptx 21/22   .csv 4/4
   .pdf  222 unverified + 31 partial + 4 unsupported(암호화)
 
-테스트 87개 통과 (표준 unittest, 프레임워크 없음)
+테스트 95개 통과 (표준 unittest, 프레임워크 없음)
+  — 그중 8개는 일부러 망가뜨린 결과가 success로 올라가지 않는지 보는 실패 검증이다
 ```
 
 테스트 문서는 전부 코드가 직접 만든 비민감 샘플이다. 실제 문서는 저장소에 들어가지 않는다.
