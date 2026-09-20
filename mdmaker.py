@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import csv
 import datetime as _dt
@@ -186,6 +187,16 @@ def present(text: str, md: str, norm: str) -> bool:
     # 적용해 양쪽을 같은 기준으로 비교한다.
     same = normalize_md(text)
     return bool(same.strip()) and same in norm
+
+
+def occurrences(text: str, md: str, norm: str) -> int:
+    """결과에 이 글자가 몇 번 나오는가. 원문에서 3번 반복된 문장이 결과에 1번만
+    있으면 중복 제거가 일어난 것이므로, 있고 없고가 아니라 횟수를 세야 한다."""
+    n = max(md.count(text), norm.count(text))
+    if n:
+        return n
+    same = normalize_md(text)
+    return norm.count(same) if same.strip() else 0
 
 
 def normalize_md(md: str) -> str:
@@ -758,6 +769,25 @@ def _unent(s: str) -> str:
     return _ENT.sub(sub, s).replace("\r\n", "\n").replace("\r", "\n")
 
 
+def count_missing(wanted, where: dict, res: Res, norm: str) -> list:
+    """원문에 나온 횟수만큼 결과에도 있는지 센다. (글자, 어디, 모자란 수) 목록."""
+    out = []
+    for txt, n in wanted.items():
+        got = occurrences(txt, res.markdown, norm)
+        if got < n:
+            out.append((txt[:60], where.get(txt, ""), n - got))
+    return out
+
+
+def report_missing(res: Res, missing: list) -> None:
+    if not missing:
+        return
+    res.demote(PARTIAL)
+    lost = sum(n for _, _, n in missing)
+    res.warn("원본 텍스트 %d개가 결과에서 확인되지 않았다(서로 다른 %d종): %r"
+             % (lost, len(missing), missing[:5]))
+
+
 def verify_ooxml_text(res: Res, zf, limits: Limits, kind: str) -> None:
     """변환기와 다른 경로(원본 XML 직접 스캔)로 요소 목록을 만들고 결과와 대조한다."""
     norm = normalize_md(res.markdown)
@@ -766,7 +796,8 @@ def verify_ooxml_text(res: Res, zf, limits: Limits, kind: str) -> None:
                   and not n.startswith("word/_rels")
                   and Path(n).name not in ("settings.xml", "styles.xml", "numbering.xml",
                                            "fontTable.xml", "webSettings.xml", "theme1.xml")]
-    missing, total = [], 0
+    wanted: collections.Counter = collections.Counter()
+    where: dict = {}
     for part in sorted(want_parts):
         data = zf.read(part)
         if len(data) > limits.max_xml_bytes:
@@ -777,14 +808,12 @@ def verify_ooxml_text(res: Res, zf, limits: Limits, kind: str) -> None:
             txt = _unent(m.group(2).decode("utf-8"))
             if not txt.strip():
                 continue
-            total += 1
-            if not present(txt, res.markdown, norm):
-                missing.append((part, txt[:60]))
-    res.checks.append({"item": "텍스트 노드", "count": total, "missing": len(missing),
-                       "ok": not missing})
-    if missing:
-        res.demote(PARTIAL)
-        res.warn("원본 텍스트 %d개가 결과에서 확인되지 않았다: %r" % (len(missing), missing[:5]))
+            wanted[txt] += 1
+            where.setdefault(txt, part)
+    missing = count_missing(wanted, where, res, norm)
+    res.checks.append({"item": "텍스트 노드", "count": sum(wanted.values()),
+                       "missing": sum(n for _, _, n in missing), "ok": not missing})
+    report_missing(res, missing)
 
     saved_parts = {i["part"] for i in res.meta.get("images", [])} if res.meta else set()
     ok_assets = all(sha256(res.assets[i["asset"]]) == i["sha256"]
@@ -1609,7 +1638,9 @@ def verify_hwpx(res: Res, zf, limits: Limits) -> None:
     parts = [n for n in zf.namelist()
              if n.endswith(".xml") and not n.startswith("Preview/")
              and re.search(r"section\d+\.xml$", n)]
-    missing, total, eq = [], 0, 0
+    wanted: collections.Counter = collections.Counter()
+    where: dict = {}
+    eq = 0
     for part in sorted(parts):
         data = zf.read(part)
         if len(data) > limits.max_xml_bytes:
@@ -1619,23 +1650,21 @@ def verify_hwpx(res: Res, zf, limits: Limits) -> None:
         for m in _HX_T.finditer(data):
             for seg in _HX_INNER_TAG.split(m.group(1)):
                 txt = _unent(seg.decode("utf-8"))
-                if not txt.strip():
-                    continue
-                total += 1
-                if not present(txt, res.markdown, norm):
-                    missing.append((part, txt[:60]))
+                if txt.strip():
+                    wanted[txt] += 1
+                    where.setdefault(txt, part)
         for m in _HX_SCRIPT.finditer(data):
             txt = _unent(_HX_INNER_TAG.sub(b"", m.group(1)).decode("utf-8"))
             if txt.strip():
                 eq += 1
-                if not present(txt, res.markdown, norm):
-                    missing.append((part, "수식:" + txt[:40]))
-    res.checks.append({"item": "텍스트 노드", "count": total, "missing": len(missing),
-                       "ok": not missing})
-    res.checks.append({"item": "수식", "count": eq, "ok": True})
-    if missing:
-        res.demote(PARTIAL)
-        res.warn("원본 텍스트 %d개가 결과에서 확인되지 않았다: %r" % (len(missing), missing[:5]))
+                wanted[txt] += 1
+                where.setdefault(txt, part + " (수식)")
+    missing = count_missing(wanted, where, res, norm)
+    res.checks.append({"item": "텍스트 노드", "count": sum(wanted.values()),
+                       "missing": sum(n for _, _, n in missing), "ok": not missing})
+    res.checks.append({"item": "수식", "count": eq,
+                       "ok": not any("수식" in w for _, w, _ in missing)})
+    report_missing(res, missing)
 
     bins = [n for n in zf.namelist() if n.startswith("BinData/") and not n.endswith("/")]
     saved = {i["part"] for i in res.meta.get("images", [])}
@@ -1965,26 +1994,24 @@ def convert_hwp(path: Path, opts, limits: Limits) -> Res:
 def verify_hwp(res: Res, sections: dict, streams: dict, hdr) -> None:
     """구조 순회와 별개로 PARA_TEXT 레코드만 평평하게 훑어 글자를 대조한다."""
     norm = normalize_md(res.markdown)
-    missing, total = [], 0
+    wanted: collections.Counter = collections.Counter()
+    where: dict = {}
     for name, body in sections.items():
         try:
             for tag, _lvl, payload in hwp5.records(body):
                 if tag != hwp5.TAG_PARA_TEXT:
                     continue
                 for kind, val in hwp5.para_text(payload):
-                    if kind != "text" or not str(val).strip():
-                        continue
-                    total += 1
-                    if not present(str(val), res.markdown, norm):
-                        missing.append((name, str(val)[:60]))
+                    if kind == "text" and str(val).strip():
+                        wanted[str(val)] += 1
+                        where.setdefault(str(val), name)
         except hwp5.HwpError as exc:
             res.warn("%s 검사 중단: %s" % (name, exc))
             res.demote(UNVERIFIED)
-    res.checks.append({"item": "텍스트 조각", "count": total, "missing": len(missing),
-                       "ok": not missing})
-    if missing:
-        res.demote(PARTIAL)
-        res.warn("원본 텍스트 %d개가 결과에서 확인되지 않았다: %r" % (len(missing), missing[:5]))
+    missing = count_missing(wanted, where, res, norm)
+    res.checks.append({"item": "텍스트 조각", "count": sum(wanted.values()),
+                       "missing": sum(n for _, _, n in missing), "ok": not missing})
+    report_missing(res, missing)
 
     bins = [k for k in streams if k.startswith("BinData/")]
     saved = {i["part"] for i in res.meta.get("images", [])}
@@ -2302,7 +2329,8 @@ def verify_pptx(res: Res, zf, limits: Limits) -> None:
     norm = normalize_md(res.markdown)
     parts = [n for n in zf.namelist()
              if re.match(r"ppt/(slides|notesSlides)/[^/]+\.xml$", n)]
-    missing, total = [], 0
+    wanted: collections.Counter = collections.Counter()
+    where: dict = {}
     for part in sorted(parts):
         data = zf.read(part)
         if len(data) > limits.max_xml_bytes:
@@ -2311,16 +2339,13 @@ def verify_pptx(res: Res, zf, limits: Limits) -> None:
             continue
         for m in _PX_T.finditer(data):
             txt = _unent(m.group(1).decode("utf-8"))
-            if not txt.strip():
-                continue
-            total += 1
-            if not present(txt, res.markdown, norm):
-                missing.append((part, txt[:60]))
-    res.checks.append({"item": "텍스트 노드", "count": total, "missing": len(missing),
-                       "ok": not missing})
-    if missing:
-        res.demote(PARTIAL)
-        res.warn("원본 텍스트 %d개가 결과에서 확인되지 않았다: %r" % (len(missing), missing[:5]))
+            if txt.strip():
+                wanted[txt] += 1
+                where.setdefault(txt, part)
+    missing = count_missing(wanted, where, res, norm)
+    res.checks.append({"item": "텍스트 노드", "count": sum(wanted.values()),
+                       "missing": sum(n for _, _, n in missing), "ok": not missing})
+    report_missing(res, missing)
     check_orphan_media(res, zf, "ppt/media/", {i["part"] for i in res.meta.get("images", [])})
 
 
@@ -2829,6 +2854,17 @@ def cache_valid(entry: dict, src: Path, out_root: Path, opts) -> bool:
 def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
                  ours: bool = False) -> tuple[Path, str | None]:
     rel = src.relative_to(root) if root != src else Path(src.name)
+    # 분할 검사는 결과 자리(성공/미완)를 정하기 전에 끝내야 한다. 나중에 등급을
+    # 내리면 미달 결과가 성공 폴더에 남는다.
+    limit = getattr(opts, "split_chars", 0) or 0
+    parts: list = []
+    if limit > 0:
+        parts = split_markdown(res.markdown, limit)
+        ok = rejoin(parts) == res.markdown
+        if not ok:
+            res.demote(PARTIAL)
+            res.warn("분할 조각을 다시 합쳤을 때 원본과 달라 분할 결과를 신뢰할 수 없다")
+        res.checks.append({"item": "분할", "parts": len(parts), "limit": limit, "ok": ok})
     base = out_root if res.status == SUCCESS else out_root / "_incomplete"
     target = base / rel.parent / (rel.name + ".md")
     assets_dir = base / rel.parent / (rel.name + ".assets")
@@ -2840,14 +2876,7 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
     tmp = Path(tempfile.mkdtemp(prefix=".mdmaker-", dir=str(target.parent)))
     made_parts: list[Path] = []
     try:
-        limit = getattr(opts, "split_chars", 0) or 0
-        if limit > 0:
-            parts = split_markdown(res.markdown, limit)
-            if rejoin(parts) != res.markdown:          # 재결합 검사: 내용·순서가 같아야 한다
-                res.demote(PARTIAL)
-                res.warn("분할 조각을 다시 합쳤을 때 원본과 달라 분할 결과를 신뢰할 수 없다")
-            res.checks.append({"item": "분할", "parts": len(parts), "limit": limit,
-                               "ok": rejoin(parts) == res.markdown})
+        if parts:
             for i, part in enumerate(parts, 1):
                 head = ("<!-- %s 조각 %d/%d · 문자 기준 분할(토큰 수와 다르다) -->\n"
                         % (src.name, i, len(parts)))

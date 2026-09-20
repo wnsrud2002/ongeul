@@ -1674,3 +1674,128 @@ class TestAppBundle(Tmp):
         self.assertEqual(im.size, (32, 32))
         colors = {p[:3] for p in im.getdata() if p[3] > 200}
         self.assertGreater(len(colors), 4)       # 단색 사각형이 아니라 그림이 들어있다
+
+
+class TestFailureDetection(Tmp):
+    """일부러 망가뜨린 결과에서 success와 종료 코드 0이 나오지 않는지 본다(가이드 11장).
+    검사기가 통과시키는 것만 보는 시험은 보존 증명이 아니다."""
+
+    def _docx_with_repeats(self, times=3):
+        p = self.inp / "반복.docx"
+        make_docx(p)
+        z = zipfile.ZipFile(p)
+        parts = {n: z.read(n) for n in z.namelist()}
+        z.close()
+        rep = "<w:p><w:r><w:t>반복되는 문장</w:t></w:r></w:p>" * times
+        parts["word/document.xml"] = parts["word/document.xml"].replace(
+            "<w:p><w:r><w:t>본문 뒤 문단</w:t></w:r></w:p>".encode(), rep.encode())
+        with zipfile.ZipFile(p, "w") as o:
+            for n, d in parts.items():
+                o.writestr(n, d)
+        return p
+
+    def _convert(self, p):
+        opts = argparse.Namespace(encoding=None, xlsx_table="auto", max_cells=10 ** 7,
+                                  ocr="off", ocr_lang="kor+eng")
+        return M.convert(p, opts, M.Limits())
+
+    def test_repeated_text_removal_is_caught(self):
+        p = self._docx_with_repeats(3)
+        good = self._convert(p)
+        self.assertEqual(good.markdown.count("반복되는 문장"), 3)
+        lossy = M.Res(p, "docx")
+        lossy.meta = {"images": []}
+        lossy.markdown = good.markdown.replace(
+            "반복되는 문장\n\n반복되는 문장\n\n반복되는 문장", "반복되는 문장")
+        with M.open_zip(p, M.Limits()) as zf:
+            M.verify_ooxml_text(lossy, zf, M.Limits(), "docx")
+        self.assertEqual(lossy.status, M.PARTIAL)
+        self.assertIn("확인되지 않았다", " ".join(lossy.warnings))
+
+    def test_original_copy_is_not_success(self):
+        """원본을 그대로 복사해 놓은 것은 변환이 아니다."""
+        p = self.inp / "그대로.docx"
+        make_docx(p)
+        fake = M.Res(p, "docx")
+        fake.meta = {"images": []}
+        fake.markdown = p.read_bytes().decode("latin-1")   # 원본 바이트만 붙인 결과
+        with M.open_zip(p, M.Limits()) as zf:
+            M.verify_ooxml_text(fake, zf, M.Limits(), "docx")
+        self.assertEqual(fake.status, M.PARTIAL)
+
+    def test_asset_bytes_changed_is_caught(self):
+        p = self.inp / "자산.docx"
+        make_docx(p)
+        res = self._convert(p)
+        self.assertEqual(res.status, M.SUCCESS)
+        broken = M.Res(p, "docx")
+        broken.markdown = res.markdown
+        broken.meta = res.meta
+        broken.assets = dict(res.assets)
+        name = next(k for k in broken.assets if k.startswith("media/"))
+        broken.assets[name] = b"\x00" * 10          # 바이트가 바뀌었다
+        with M.open_zip(p, M.Limits()) as zf:
+            M.verify_ooxml_text(broken, zf, M.Limits(), "docx")
+        self.assertEqual(broken.status, M.PARTIAL)
+        self.assertIn("자산 해시가 일치하지 않는다", " ".join(broken.warnings))
+
+    def test_equation_loss_is_caught(self):
+        p = self.inp / "수식.hwpx"
+        make_hwpx(p)
+        res = self._convert(p)
+        self.assertIn("E=mc^2", res.markdown)
+        lossy = M.Res(p, "hwpx")
+        lossy.meta = {"images": []}
+        lossy.markdown = res.markdown.replace("`[수식] E=mc^2`", "")
+        with M.open_zip(p, M.Limits()) as zf:
+            M.verify_hwpx(lossy, zf, M.Limits())
+        self.assertEqual(lossy.status, M.PARTIAL)
+        eq = [c for c in lossy.checks if c["item"] == "수식"][0]
+        self.assertFalse(eq["ok"])
+
+    def test_split_piece_lost_or_reordered_is_caught(self):
+        p = self.inp / "긴글.txt"
+        p.write_text("\n\n".join("문단 %d %s" % (i, "가나다" * 30) for i in range(30)),
+                     encoding="utf-8")
+        orig = M.split_markdown          # 원본을 잡아두고 흉내 낸다(재귀 방지)
+        for name, bad in (("조각 누락", lambda parts: parts[:-1]),
+                          ("순서 바뀜", lambda parts: list(reversed(parts)))):
+            with self.subTest(name):
+                saved = M.split_markdown
+                M.split_markdown = lambda body, n, _b=bad: _b(orig(body, n))
+                try:
+                    code = self.run_cli(p, "--out", self.out / name, "--split-chars", "900")
+                finally:
+                    M.split_markdown = saved
+                self.assertEqual(code, 1, name)
+                md = (self.out / name / "_incomplete" / "긴글.txt.md").read_text(encoding="utf-8")
+                self.assertIn("다시 합쳤을 때 원본과 달라", md)
+
+    def test_cell_value_change_is_caught(self):
+        p = self.inp / "값바뀜.xlsx"
+        make_xlsx(p)
+        res = self._convert(p)
+        self.assertEqual(res.status, M.SUCCESS)
+        tampered = M.Res(p, "xlsx")
+        tampered.markdown = res.markdown.replace("항목", "바뀐값")
+        tampered.meta = {"images": []}
+        cellmap = {("매출", "A1"): {"raw": "바뀐값", "formula": None, "rendered": "바뀐값",
+                                   "nf": None, "type": "s"}}
+        M.verify_xlsx(tampered, p, cellmap, M.Limits())
+        self.assertEqual(tampered.status, M.PARTIAL)
+        self.assertIn("불일치", " ".join(tampered.warnings))
+
+    def test_ocr_and_pdf_never_reach_success(self):
+        make_pdf(self.inp / "a.pdf")
+        (self.inp / "b.png").write_bytes(PNG)
+        for name in ("a.pdf", "b.png"):
+            res = self._convert(self.inp / name)
+            self.assertNotEqual(res.status, M.SUCCESS, name)
+
+    def test_whole_run_exit_code_is_not_zero(self):
+        """한 파일이라도 미달이면 일괄 실행 전체가 0을 내지 않는다."""
+        (self.inp / "ok.txt").write_text("정상", encoding="utf-8")
+        make_pdf(self.inp / "bad.pdf")
+        self.assertEqual(self.run_cli(self.inp, "--out", self.out, "--recursive"), 1)
+        self.assertTrue((self.out / "ok.txt.md").exists())
+        self.assertTrue((self.out / "_incomplete" / "bad.pdf.md").exists())
