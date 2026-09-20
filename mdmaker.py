@@ -15,6 +15,7 @@ import copy
 import csv
 import datetime as _dt
 import hashlib
+import html
 import io
 import json
 import os
@@ -32,6 +33,7 @@ import xml.etree.ElementTree as ET
 
 import hwp5
 import pdf
+import pdfwrite
 import xls
 from pathlib import Path
 
@@ -3001,6 +3003,217 @@ def status_section(res: Res) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------- PDF 내보내기
+def md_to_html(md: str, title: str) -> str:
+    """LibreOffice 로 PDF를 만들 때 쓰는 중간 HTML. 우리가 쓰는 표기만 다룬다."""
+    out = ["<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>%s</title>"
+           "<style>body{font-family:'Apple SD Gothic Neo','Malgun Gothic',sans-serif;"
+           "font-size:10.5pt;line-height:1.5;margin:2cm}"
+           "table{border-collapse:collapse;width:100%%}td,th{border:1px solid #bbb;padding:3px 5px;"
+           "font-size:9pt}blockquote{color:#555;border-left:3px solid #ccc;margin:6px 0;"
+           "padding-left:10px}pre{background:#f5f5f7;padding:8px;white-space:pre-wrap;"
+           "font-size:8.5pt}h1,h2{border-bottom:1px solid #ddd;padding-bottom:3px}"
+           "</style></head><body>" % html.escape(title)]
+    lines = md.split("\n")
+    i = 0
+    in_table = False
+
+    def esc(t):
+        return html.escape(pdfwrite.plain(t))
+
+    while i < len(lines):
+        line = lines[i]
+        st = line.strip()
+        if st.startswith("```"):
+            j = i + 1
+            block = []
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                block.append(lines[j])
+                j += 1
+            out.append("<pre>%s</pre>" % html.escape("\n".join(block)))
+            i = j + 1
+            continue
+        if st.startswith("|") and st.endswith("|"):
+            cells = [c.strip() for c in st.strip("|").split("|")]
+            if all(set(c) <= set("-: ") for c in cells):
+                i += 1
+                continue
+            if not in_table:
+                out.append("<table>")
+                in_table = True
+            tag = "th" if len(out) and out[-1] == "<table>" else "td"
+            out.append("<tr>" + "".join("<%s>%s</%s>" % (tag, esc(c), tag) for c in cells) + "</tr>")
+            i += 1
+            if i >= len(lines) or not lines[i].strip().startswith("|"):
+                out.append("</table>")
+                in_table = False
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", st)
+        if m:
+            n = len(m.group(1))
+            out.append("<h%d>%s</h%d>" % (n, esc(m.group(2)), n))
+            i += 1
+            continue
+        if st.startswith(">"):
+            out.append("<blockquote>%s</blockquote>" % esc(st.lstrip("> ")))
+            i += 1
+            continue
+        m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", line)
+        if m:
+            out.append("<div style=\"margin-left:%dpx\">• %s</div>"
+                       % (14 + len(m.group(1)) // 2 * 14, esc(m.group(3))))
+            i += 1
+            continue
+        if re.match(r"^(-{3,}|={3,})$", st):
+            out.append("<hr>")
+            i += 1
+            continue
+        out.append("<p>%s</p>" % esc(line) if st else "<div style='height:6px'></div>")
+        i += 1
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
+def soffice_to_pdf(src: Path, out_pdf: Path, limits: Limits) -> str:
+    """LibreOffice 로 PDF를 만든다. 실패하면 이유 문자열을 돌려준다."""
+    exe = soffice_path()
+    if not exe:
+        return "LibreOffice 가 없어 PDF를 만들지 못했다"
+    tmp = Path(tempfile.mkdtemp(prefix="mdmaker-pdf-"))
+    try:
+        try:
+            r = subprocess.run([exe, "--headless", "--norestore", "--nolockcheck", "--nodefault",
+                                "-env:UserInstallation=file://%s/profile" % tmp,
+                                "--convert-to", "pdf", "--outdir", str(tmp), str(src)],
+                               capture_output=True, timeout=limits.convert_timeout, shell=False,
+                               cwd=str(tmp))
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return "LibreOffice 실행 실패: %s" % exc
+        made = sorted(tmp.glob("*.pdf"))
+        if r.returncode != 0 or not made:
+            return "LibreOffice 변환 실패(코드 %d)" % r.returncode
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(made[0], out_pdf)
+        return ""
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_PDF_NOISE = re.compile(r"[\s|`*~<>\[\]()!#\-·]")
+
+
+def _pdf_flat(text: str) -> str:
+    """PDF 대조용 납작한 글자열. 양쪽에 같은 규칙을 써야 한다(한쪽만 지우면 오탐).
+    그림 표기는 글자가 아니라 그림으로 그려지므로 빼고 본다."""
+    return _PDF_NOISE.sub("", pdfwrite.plain(pdfwrite._IMG.sub("", text)))
+
+
+def verify_made_pdf(path: Path, md: str, sample: int = 400) -> tuple[int, int, int]:
+    """만든 PDF를 우리 리더로 다시 읽어 글자가 들어갔는지 본다.
+    (쪽 수, 검사한 줄, 못 찾은 줄)"""
+    try:
+        doc = pdf.Pdf(path.read_bytes())
+        pages = doc.pages()
+        got = "".join("".join(pdf.extract_page(doc, p).parts) for p in pages)
+    except (pdf.PdfError, OSError, ValueError):
+        return 0, 0, -1
+    flat = _pdf_flat(got)
+    checked = missing = 0
+    for line in md.split("\n"):
+        t = _pdf_flat(line)
+        if len(t) < 6:
+            continue
+        checked += 1
+        if checked > sample:
+            break
+        if t not in flat:
+            missing += 1
+    return len(pages), min(checked, sample), missing
+
+
+def _pdf_is_garbage(checked: int, missing: int) -> bool:
+    """만든 PDF가 원본과 너무 다르면 쓸 수 없는 것이다. 그럴듯한 쓰레기를 남기지 않는다."""
+    return checked >= 4 and (missing < 0 or missing / float(checked) > 0.5)
+
+
+def _pdf_blame(engine: str) -> str:
+    if engine == "soffice":
+        return ("LibreOffice 가 한글 글꼴을 찾지 못했거나 이 형식을 열지 못한 것으로 보인다")
+    return "글꼴이나 배치에 문제가 있는 것으로 보인다"
+
+
+def make_pdfs(res: Res, src: Path, target: Path, assets_dir: Path, opts, limits: Limits,
+              work: Path) -> list:
+    """결과 PDF와 원본 PDF를 work 폴더에 만들고 (만든 파일, 최종 이름) 목록을 돌려준다.
+
+    Markdown 과 meta.json 을 쓰기 전에 돌아야 여기서 생긴 경고·기록이 결과에 남는다.
+    만든 PDF는 변환 산출물이지 보존 검증 대상이 아니다."""
+    want = getattr(opts, "pdf", "off")
+    if want in ("off", None):
+        return []
+    made = {}
+    files: list = []
+    if want in ("result", "both"):
+        final_name = target.with_suffix(".pdf").name
+        out_pdf = work / final_name
+        engine = getattr(opts, "pdf_engine", "builtin")
+        if engine == "soffice":
+            tmp = Path(tempfile.mkdtemp(prefix="mdmaker-html-"))
+            try:
+                html_path = tmp / (target.stem + ".html")
+                html_path.write_text(md_to_html(res.markdown + status_section(res), src.name),
+                                     encoding="utf-8")
+                err = soffice_to_pdf(html_path, out_pdf, limits)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            if err:
+                res.warn("결과 PDF를 만들지 못했다: %s" % err)
+                return
+        else:
+            font, why = pdfwrite.find_font(getattr(opts, "pdf_font", None))
+            if font is None:
+                res.warn("결과 PDF를 만들지 못했다: %s" % why)
+                return
+            try:
+                out_pdf.write_bytes(pdfwrite.render_markdown(
+                    res.markdown + status_section(res), font, src.name, base_dir=assets_dir))
+            except (pdfwrite.FontError, OSError, ValueError, struct.error) as exc:
+                res.warn("결과 PDF를 만들지 못했다: %s: %s" % (type(exc).__name__, exc))
+                return
+        pages, checked, miss = verify_made_pdf(out_pdf, res.markdown)
+        if _pdf_is_garbage(checked, miss):
+            out_pdf.unlink(missing_ok=True)
+            res.warn("결과 PDF를 만들었지만 본문이 %d줄 중 %d줄이나 달라 버렸다(%s). "
+                     "Markdown 은 그대로다." % (checked, miss, _pdf_blame(engine)))
+        else:
+            files.append((out_pdf, final_name))
+            made["result"] = {"path": final_name, "pages": pages, "checked_lines": checked,
+                              "missing_lines": miss, "engine": engine}
+            if miss > 0:
+                res.warn("만든 PDF에서 본문 %d줄을 다시 찾지 못했다(PDF만 해당, Markdown은 그대로)"
+                         % miss)
+    if want in ("source", "both"):
+        final_name = target.stem + ".source.pdf"
+        out_pdf = work / final_name
+        err = soffice_to_pdf(src, out_pdf, limits)
+        if err:
+            res.warn("원본 PDF를 만들지 못했다: %s" % err)
+        else:
+            pages, checked, miss = verify_made_pdf(out_pdf, res.markdown)
+            if _pdf_is_garbage(checked, miss):
+                out_pdf.unlink(missing_ok=True)
+                res.warn("원본 PDF를 만들었지만 본문이 %d줄 중 %d줄이나 달라 버렸다(%s). "
+                         "쓸 수 없는 PDF를 남기지 않는다." % (checked, miss, _pdf_blame("soffice")))
+            else:
+                files.append((out_pdf, final_name))
+                made["source"] = {"path": final_name, "pages": pages,
+                                  "checked_lines": checked, "missing_lines": miss,
+                                  "bytes": out_pdf.stat().st_size}
+    if made:
+        res.info["pdf"] = made
+    return files
+
+
 def split_markdown(body: str, limit: int) -> list[str]:
     """제목·문단 경계에서만 자른다. 한 덩어리가 한도보다 크면 줄 단위로 더 자른다."""
     blocks = body.split("\n\n")
@@ -3035,7 +3248,8 @@ def rejoin(parts: list[str]) -> str:
 def options_key(opts) -> str:
     return json.dumps({k: getattr(opts, k, None)
                        for k in ("encoding", "xlsx_table", "max_cells", "ocr", "ocr_lang",
-                                 "split_chars")}, ensure_ascii=False, sort_keys=True)
+                                 "split_chars", "pdf", "pdf_engine", "pdf_font")},
+                      ensure_ascii=False, sort_keys=True)
 
 
 def cache_path(out_root: Path) -> Path:
@@ -3074,7 +3288,7 @@ def cache_valid(entry: dict, src: Path, out_root: Path, opts) -> bool:
 
 
 def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
-                 ours: bool = False) -> tuple[Path, str | None]:
+                 ours: bool = False, limits: Limits | None = None) -> tuple[Path, str | None]:
     rel = src.relative_to(root) if root != src else Path(src.name)
     # 분할 검사는 결과 자리(성공/미완)를 정하기 전에 끝내야 한다. 나중에 등급을
     # 내리면 미달 결과가 성공 폴더에 남는다.
@@ -3105,7 +3319,6 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
                 fn = "%s.part%02d.md" % (rel.name, i)
                 (tmp / fn).write_text(head + part, encoding="utf-8", newline="\n")
                 made_parts.append(tmp / fn)
-        (tmp / "doc.md").write_text(res.markdown + status_section(res), encoding="utf-8", newline="\n")
         adir = tmp / "assets"        # meta.json이 보존 검사 기록이라 항상 만든다
         adir.mkdir()
         listing = []
@@ -3114,6 +3327,10 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
             f2.parent.mkdir(parents=True, exist_ok=True)
             f2.write_bytes(data)
             listing.append({"path": name, "sha256": sha256(data), "bytes": len(data)})
+        pdf_files = make_pdfs(res, src, target, adir, opts, limits or Limits(), tmp)
+        # 본문과 기록은 PDF까지 만든 뒤에 쓴다. PDF에서 생긴 경고도 상태에 남아야 한다.
+        (tmp / "doc.md").write_text(res.markdown + status_section(res),
+                                    encoding="utf-8", newline="\n")
         (adir / "meta.json").write_text(json.dumps({
             "source": src.name, "source_sha256": sha256(src.read_bytes()),
             "format": res.fmt, "status": res.status, "warnings": res.warnings,
@@ -3137,6 +3354,8 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
             os.replace(adir, assets_dir)
         except OSError as exc:
             return target, "보조 폴더를 놓지 못했다(동시 실행 충돌일 수 있다): %s" % exc
+        for made, name in pdf_files:
+            os.replace(made, target.parent / name)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return target, None
@@ -3168,6 +3387,10 @@ def check_options(files: list[Path], opts) -> str | None:
         return "--ocr 은 PDF·이미지 입력에만 쓴다"
     if opts.split_chars < 0:
         return "--split-chars 는 0보다 커야 한다"
+    if opts.pdf in ("source", "both") and not soffice_path():
+        return "--pdf %s 는 LibreOffice 가 있어야 한다(원본을 그대로 PDF로 만드는 유일한 길)" % opts.pdf
+    if opts.pdf == "off" and opts.pdf_engine != "builtin":
+        return "--pdf-engine 은 --pdf 와 함께 쓴다"
     return None
 
 
@@ -3205,7 +3428,7 @@ def run_batch(files, root: Path, out_root: Path, opts, limits: Limits, single: b
                          "platform": platform.platform(),
                          "python": sys.version.split()[0]})
         target, conflict = write_result(res, f, root, out_root, opts,
-                                        ours=bool(opts.reuse and key in cache))
+                                        ours=bool(opts.reuse and key in cache), limits=limits)
         if conflict:
             yield {"rel": rel, "status": "conflict", "target": target,
                    "elapsed": res.info["elapsed_sec"], "warnings": [conflict]}
@@ -3272,6 +3495,11 @@ def main(argv=None) -> int:
     ap.add_argument("--ocr-lang", default="kor+eng", help="OCR 언어 데이터 이름")
     ap.add_argument("--split-chars", type=int, default=0,
                     help="결과를 문자 수 기준으로 나눠 조각 파일도 함께 만든다(토큰 수 아님)")
+    ap.add_argument("--pdf", choices=("off", "result", "source", "both"), default="off",
+                    help="PDF도 만든다: result=변환 결과, source=원본 문서, both=둘 다")
+    ap.add_argument("--pdf-engine", choices=("builtin", "soffice"), default="builtin",
+                    help="결과 PDF 생성기 (builtin=의존성 없음, soffice=LibreOffice)")
+    ap.add_argument("--pdf-font", help="결과 PDF에 넣을 글꼴 파일 (기본은 시스템 한글 글꼴)")
     ap.add_argument("--reuse", action="store_true",
                     help="이전에 전체 보존 검증을 통과한 결과를 재검증 후 건너뛴다")
     opts = ap.parse_args(argv)

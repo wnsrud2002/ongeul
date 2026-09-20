@@ -14,6 +14,8 @@ import zipfile
 from pathlib import Path
 
 import mdmaker as M
+import pdf
+import pdfwrite
 import xls
 
 PNG = base64.b64decode(
@@ -1909,3 +1911,146 @@ class TestLegacyXls(Tmp):
         M.verify_legacy_xls(lossy, self.p)
         self.assertEqual(lossy.status, M.PARTIAL)
         self.assertIn("중간 변환에서 원본 글자", " ".join(lossy.warnings))
+
+
+MD_SAMPLE = """# 온글 PDF 시험
+
+본문 문단이다. 한글과 English와 漢字를 같이 쓴다.
+
+- 첫째 항목
+- 둘째 항목
+
+| 열1 | 열2 |
+| --- | --- |
+| 표셀가 | 표셀나 |
+
+> 인용문이다.
+
+```text
+코드 블록 안의 글자
+```
+
+![그림 설명](media/점.png)
+"""
+
+
+class TestPdfWrite(Tmp):
+    def setUp(self):
+        super().setUp()
+        self.font, why = pdfwrite.find_font()
+        if self.font is None:
+            self.skipTest(why)
+
+    def test_subset_is_small_and_keeps_used_glyphs(self):
+        text = "온글 가나다 ABC"
+        gids = {self.font.gid(c) for c in text}
+        sub = self.font.subset(gids)
+        self.assertLess(len(sub), len(self.font.d) / 4)      # 통째로 넣지 않는다
+        self.assertEqual(sub[:4], b"\x00\x01\x00\x00")       # 제대로 된 TrueType
+        self.assertTrue(all(g > 0 for g in gids))
+
+    def test_refuses_font_that_forbids_embedding(self):
+        saved = self.font.fs_type
+        try:
+            self.font.fs_type = 0x0002
+            self.assertFalse(self.font.embeddable)
+        finally:
+            self.font.fs_type = saved
+        self.assertTrue(self.font.embeddable)
+
+    def test_render_and_read_back(self):
+        """만든 PDF를 우리 PDF 리더로 다시 읽어 글자가 들어갔는지 본다."""
+        (self.inp / "media").mkdir()
+        (self.inp / "media" / "점.png").write_bytes(PNG)
+        data = pdfwrite.render_markdown(MD_SAMPLE, self.font, "시험", base_dir=self.inp)
+        out = self.d / "a.pdf"
+        out.write_bytes(data)
+        doc = pdf.Pdf(out.read_bytes())
+        got = "".join("".join(pdf.extract_page(doc, p).parts) for p in doc.pages())
+        for probe in ("온글 PDF 시험", "漢字", "첫째 항목", "표셀가", "인용문이다",
+                      "코드 블록 안의 글자", "그림 설명"):
+            self.assertIn(probe, got, probe)
+
+    def test_decomposed_hangul_is_composed_when_drawn(self):
+        import unicodedata
+        nfd = unicodedata.normalize("NFD", "체육대회")
+        self.assertNotEqual(nfd, "체육대회")
+        data = pdfwrite.render_markdown("# " + nfd, self.font, "x")
+        doc = pdf.Pdf(data)
+        got = "".join("".join(pdf.extract_page(doc, p).parts) for p in doc.pages())
+        self.assertIn("체육대회", got)          # 자모로 흩어지지 않는다
+
+    def test_long_document_breaks_into_pages(self):
+        md = "\n\n".join("문단 %d %s" % (i, "가나다라마바사" * 8) for i in range(120))
+        doc = pdf.Pdf(pdfwrite.render_markdown(md, self.font, "x"))
+        self.assertGreater(len(doc.pages()), 2)
+
+
+class TestPdfExport(Tmp):
+    def setUp(self):
+        super().setUp()
+        if pdfwrite.find_font()[0] is None:
+            self.skipTest("PDF 글꼴 없음")
+
+    def test_result_pdf_is_made_and_checked(self):
+        make_docx(self.inp / "계약서.docx")
+        self.assertEqual(self.run_cli(self.inp / "계약서.docx", "--out", self.out,
+                                      "--pdf", "result"), 0)
+        made = self.out / "계약서.docx.pdf"
+        self.assertTrue(made.exists())
+        meta = json.loads((self.out / "계약서.docx.assets" / "meta.json").read_text(encoding="utf-8"))
+        info = meta["info"]["pdf"]["result"]
+        self.assertEqual(info["engine"], "builtin")
+        self.assertGreaterEqual(info["pages"], 1)
+        self.assertEqual(info["missing_lines"], 0)       # 본문이 다 들어갔다
+        doc = pdf.Pdf(made.read_bytes())
+        got = "".join("".join(pdf.extract_page(doc, p).parts) for p in doc.pages())
+        self.assertIn("계약서 제목", got)
+
+    def test_pdf_off_by_default(self):
+        make_docx(self.inp / "a.docx")
+        self.run_cli(self.inp / "a.docx", "--out", self.out)
+        self.assertEqual(list(self.out.glob("*.pdf")), [])
+
+    def test_source_pdf_needs_libreoffice(self):
+        make_docx(self.inp / "a.docx")
+        if M.soffice_path():
+            self.skipTest("LibreOffice 가 있다")
+        self.assertEqual(self.run_cli(self.inp / "a.docx", "--out", self.out,
+                                      "--pdf", "source"), 2)
+
+    def test_source_pdf_with_libreoffice(self):
+        """원본 PDF는 LibreOffice 몫이다. 제대로 나왔거나, 아니면 이유를 남기고 버려야 한다.
+        (LibreOffice 가 한글 글꼴을 못 찾는 환경이 실제로 있다.)"""
+        if not M.soffice_path():
+            self.skipTest("LibreOffice 없음")
+        make_xlsx(self.inp / "매출.xlsx")
+        self.assertEqual(self.run_cli(self.inp / "매출.xlsx", "--out", self.out,
+                                      "--pdf", "both"), 0)
+        self.assertTrue((self.out / "매출.xlsx.pdf").exists())     # 결과 PDF는 우리 몫
+        md = self.md_of("매출.xlsx")
+        made = (self.out / "매출.xlsx.source.pdf").exists()
+        self.assertTrue(made or "쓸 수 없는 PDF를 남기지 않는다" in md,
+                        "원본 PDF가 없으면 이유가 적혀 있어야 한다")
+
+    def test_garbage_pdf_is_discarded_not_kept(self):
+        self.assertTrue(M._pdf_is_garbage(10, 9))
+        self.assertTrue(M._pdf_is_garbage(10, -1))      # 아예 읽지 못한 경우
+        self.assertFalse(M._pdf_is_garbage(10, 2))
+        self.assertFalse(M._pdf_is_garbage(2, 2))       # 표본이 너무 적으면 판단하지 않는다
+
+    def test_broken_render_is_reported(self):
+        """PDF에 본문이 빠지면 경고한다. Markdown 자체는 영향받지 않는다."""
+        make_docx(self.inp / "b.docx")
+        saved = pdfwrite.render_markdown
+        pdfwrite.render_markdown = lambda md, font, title, base_dir=None: saved(
+            "# 제목만 남긴다", font, title, base_dir)
+        try:
+            code = self.run_cli(self.inp / "b.docx", "--out", self.out, "--pdf", "result")
+        finally:
+            pdfwrite.render_markdown = saved
+        self.assertEqual(code, 0)                         # Markdown 은 그대로 success
+        md = self.md_of("b.docx")
+        self.assertIn("본문이", md)
+        self.assertIn("Markdown 은 그대로다", md)
+        self.assertFalse((self.out / "b.docx.pdf").exists())   # 쓰레기를 남기지 않는다

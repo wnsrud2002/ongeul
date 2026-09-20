@@ -7,9 +7,10 @@
 문서를 AI에 넣기 전에 미리 텍스트로 뽑아두는 용도다. 변환 과정에서 외부로 나가는 것은 없다.
 
 ```sh
-python3 mdmaker.py "계약서.hwp" --out 출력       # 명령줄
-python3 gui.py                                   # 창 화면
-python3 build_app.py && open dist/온글.app       # macOS 앱으로
+python3 mdmaker.py "계약서.hwp" --out 출력          # 명령줄
+python3 mdmaker.py "계약서.hwp" --out 출력 --pdf result   # PDF로도 뽑기
+python3 gui.py                                      # 창 화면
+python3 build_app.py && open dist/온글.app          # macOS 앱으로
 ```
 
 ---
@@ -75,7 +76,7 @@ success가 아닌 것의 사유는 전부 특정돼 있다
     2  이미지 — 내용은 사람이 검수해야 확정된다
     3  글자도 이미지도 없는 순수 도형 — 생김새를 Markdown으로 표현할 수 없다
 
-테스트 100개 통과 (표준 unittest, 프레임워크 없음)
+테스트 111개 통과 (표준 unittest, 프레임워크 없음)
   — 그중 8개는 일부러 망가뜨린 결과가 success로 올라가지 않는지 보는 실패 검증이다
   — CI는 리눅스·macOS·윈도우 × 파이썬 3.11/3.12/3.13 = 9개 조합
 ```
@@ -109,6 +110,8 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 | `--ocr off\|auto\|force`, `--ocr-lang` | 이미지 글자 읽기 (로컬 Tesseract 필요) |
 | `--split-chars N` | 결과를 N자 기준으로 조각내고, **재결합이 원본과 같은지 검사** |
 | `--reuse` | 내용 해시·옵션·버전이 모두 같고 결과까지 온전할 때만 건너뜀 |
+| `--pdf result\|source\|both` | PDF도 만든다 (아래 참고) |
+| `--pdf-engine builtin\|soffice`, `--pdf-font` | 결과 PDF 생성기와 글꼴 |
 
 출력은 이렇게 놓인다.
 
@@ -124,6 +127,30 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 
 ---
 
+## PDF로 내보내기
+
+```sh
+python3 mdmaker.py 입력 --out 출력 --pdf result   # 변환 결과를 PDF로
+python3 mdmaker.py 입력 --out 출력 --pdf both     # 원본 문서도 PDF로 (LibreOffice 필요)
+```
+
+`result` 는 온글이 직접 PDF를 쓴다. **의존성이 없다** — 시스템 한글 글꼴을 찾아 쓰인
+글자만 추려 넣는다(23MB 글꼴 → 400KB 부분집합). 제목·목록·표·인용·코드 블록을
+그리고, 그림은 링크가 아니라 본문에 넣는다.
+
+**만든 PDF는 우리 PDF 리더로 다시 읽어 검사한다.** 본문이 절반 넘게 다르면 그럴듯한
+쓰레기를 남기지 않고 지우면서 이유를 적는다. 실제로 이 검사가 잡은 것:
+
+- macOS 파일 이름은 자모가 분해된 형태(NFC 아님)로 와서 "체육"이 "ㅊㅔㅇㅠㄱ"으로 그려졌다.
+- `--pdf source` 는 LibreOffice 몫인데, 이 컴퓨터에서는 한글 글꼴을 찾지 못해 모든 한글을
+  같은 글리프로 그렸고 `.hwp` 는 바이너리를 글자로 오인해 1114쪽짜리 쓰레기를 만들었다.
+  검사가 잡아내서 버렸다.
+
+글꼴은 임베딩 허가(OS/2 `fsType`)를 확인하고, 금지된 글꼴은 넣지 않는다.
+`--pdf-font` 로 직접 지정할 수 있다.
+
+---
+
 ## 한계 (숨기지 않는 것)
 
 - **PDF는 설계상 항상 `unverified`다.** PDF 파일은 문단·표·읽기 순서를 담지 않는다. 글자 좌표로 줄을 재구성할 뿐이라 자동으로 보존을 확정할 수 없다. 다단 편집이나 표는 사람이 원본과 대조해야 한다.
@@ -131,6 +158,8 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 - **OCR 결과는 검수 전 상태다.** 숫자·고유명사·표에 오류가 있을 수 있어 사람이 보기 전에는 확정된 내용이 아니다.
 - 검사는 텍스트·셀 값·자산 바이트 기준이다. 글꼴·정렬 같은 서식 전반은 검사 대상이 아니다.
 - 토큰 수가 아니라 **문자 수**만 센다. 분할 단위도 문자 기준이다.
+- PDF 내보내기는 **변환 산출물이지 보존 검증 대상이 아니다**. 보존을 보장하는 것은 Markdown 과
+  보조 파일이고, PDF는 읽기 좋으라고 만든 것이다.
 
 ---
 
@@ -144,6 +173,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 | `hwp5.py` | HWP 5.x 저수준 리더 — CFB(OLE) 복합 파일과 레코드 스트림 |
 | `pdf.py` | PDF 저수준 리더 — 객체·스트림·필터·폰트 인코딩 |
 | `xls.py` | 구형 엑셀(BIFF8) 문자열·시트 이름 리더 — 중간 변환 대조용 |
+| `pdfwrite.py` | PDF 쓰기 — TrueType 부분집합 추출, Type0 글꼴 임베딩, 마크다운 배치 |
 | `gui.py` | 창 화면 (tkinter). CLI와 같은 변환 경로를 쓴다 |
 | `build_app.py` | macOS `.app` 묶음 만들기 (iconutil + plistlib) |
 | `mdmaker.md` | 개발 가이드라인 (이 프로그램이 지켜야 할 규칙) |
