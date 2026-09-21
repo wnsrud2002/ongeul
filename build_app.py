@@ -22,7 +22,7 @@ SKIP_SOURCES = ("build_app.py",)
 def sources(project: Path) -> list[Path]:
     return sorted(p for p in project.glob("*.py")
                   if p.name not in SKIP_SOURCES and not p.name.startswith("test_"))
-ICON_SIZES = (16, 32, 64, 128, 256, 512, 1024)
+ICON_SIZES = (16, 32, 128, 256, 512)
 KOREAN_FONTS = ("/System/Library/Fonts/AppleSDGothicNeo.ttc",
                 "/System/Library/Fonts/Supplemental/AppleGothic.ttf")
 
@@ -90,6 +90,7 @@ def make_icns(dest: Path) -> bool:
 
 LAUNCHER = """#!/bin/sh
 # 온글 실행기: 창 화면에 필요한 파이썬을 찾아서 띄운다.
+[ -n "$TMPDIR" ] || export TMPDIR=/tmp
 DIR=$(cd "$(dirname "$0")/../Resources/app" && pwd)
 for PY in %s /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
     [ -x "$PY" ] || PY=$(command -v "$PY" 2>/dev/null) || continue

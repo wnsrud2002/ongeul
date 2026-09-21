@@ -12,7 +12,7 @@
 <br>
 
 [![테스트](https://github.com/wnsrud2002/ongeul/actions/workflows/test.yml/badge.svg)](https://github.com/wnsrud2002/ongeul/actions/workflows/test.yml)
-![의존성](https://img.shields.io/badge/외부_의존성-0개-2ea44f)
+![외부 API](https://img.shields.io/badge/외부_API-0개-2ea44f)
 ![파이썬](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![플랫폼](https://img.shields.io/badge/macOS_·_Linux_·_Windows-검증됨-555)
 ![라이선스](https://img.shields.io/badge/License-MIT-blue)
@@ -26,6 +26,16 @@
 
 <br>
 
+## 이번 변경
+
+- GUI를 문서 선택 → 변환 설정 → 결과 확인 흐름으로 정리하고, 한국어 옵션과 진행 상태를 바로 보이게 바꿨다.
+- 배치 실행마다 `summary.json`을 원자적으로 기록해 파일별 상태·경고·출력 경로를 다른 도구에서도 읽을 수 있다.
+- `--reuse`는 Markdown뿐 아니라 메타데이터·분할 파일·PDF까지 모든 산출물의 해시가 맞을 때만 재사용한다.
+- 덮어쓸 때 이전 분할 파일이나 `_incomplete` 결과를 함께 치워 한 입력에 낡은 결과가 남지 않는다.
+- 긴 한 줄도 `--split-chars` 한도 안에서 자르되, 다시 합치면 원문과 정확히 같도록 고쳤다.
+
+<br>
+
 ## 왜 만들었나
 
 문서를 AI에 넣기 전에 텍스트로 뽑아두려고 만들었다. 그런데 기존 변환기들은 **결과 파일이 나오면 성공**이라고 말한다.
@@ -34,13 +44,14 @@
 온글은 그걸 하지 않는다. **변환한 결과를 원본과 대조해서, 통과한 것만 `success` 라고 쓴다.**
 
 ```sh
+python3 -m pip install -r requirements.txt
 python3 mdmaker.py "계약서.hwp" --out 출력                       # 명령줄
 python3 mdmaker.py 입력폴더 --out 출력 --recursive --pdf result   # 폴더 통째로 + PDF까지
 python3 gui.py                                                   # 창 화면
 python3 build_app.py && open dist/온글.app                        # macOS 앱으로
 ```
 
-설치할 것이 없다. 파이썬 표준 라이브러리와, 엑셀을 읽는 `openpyxl` 하나만 쓴다.
+외부 서비스 설정이나 API 키는 필요 없다. 외부 패키지는 엑셀용 `openpyxl`과 PDF 이미지·앱 아이콘용 `Pillow` 두 개다.
 
 <br>
 
@@ -141,7 +152,7 @@ python3 mdmaker.py 입력 --out 출력 --pdf both     # 원본 문서도 → PDF
 
 success가 아닌 것의 사유는 **전부 특정돼 있다** — PDF 구조상 확인 불가(222) · PDF 폰트에 대응표 없음(31) · 암호화 PDF(4) · 이미지 내용(2) · 글자도 이미지도 없는 순수 도형(3).
 
-테스트 **119개** 통과. 그중 **8개는 일부러 망가뜨린 결과가 `success` 로 올라가지 않는지** 보는 실패 검증이다.
+테스트 **125개** 통과. 그중 **8개는 일부러 망가뜨린 결과가 `success` 로 올라가지 않는지** 보는 실패 검증이다.
 CI는 **리눅스 · macOS · 윈도우 × 파이썬 3.11 / 3.12 / 3.13 = 9개 조합**에서 돈다.
 
 <br>
@@ -190,6 +201,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 ```
 출력/계약서.hwp.md
 출력/계약서.hwp.pdf              --pdf result 일 때
+출력/summary.json                 파일별 상태·경고·출력 경로를 모은 배치 결과
 출력/계약서.hwp.assets/
     meta.json                   보존 검사 기록 · 구조/서식 정보 · 처리 정보
     media/                      원본 바이트 그대로의 이미지·첨부
@@ -202,7 +214,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 
 ## 만든 방식
 
-새 의존성을 추가하지 않았다. 표준 라이브러리와, 이미 설치돼 있던 `openpyxl`(엑셀)·`Pillow`(PDF 이미지 복원)만 쓴다.
+외부 패키지는 `openpyxl`(엑셀)·`Pillow`(PDF 이미지 복원과 앱 아이콘)만 쓴다.
 
 | 파일 | 하는 일 |
 | :--- | :--- |
@@ -213,7 +225,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 | `xls.py` | 구형 엑셀(BIFF8) 문자열·시트 이름 리더 |
 | `gui.py` | 창 화면 (tkinter). CLI와 같은 변환 경로를 쓴다 |
 | `build_app.py` | macOS `.app` 묶음 만들기 (iconutil + plistlib) |
-| `test_mdmaker.py` | 테스트 119개 (표준 `unittest`, 프레임워크 없음) |
+| `test_mdmaker.py` | 테스트 125개 (표준 `unittest`, 프레임워크 없음) |
 
 ```sh
 python3 -m unittest discover -s . -p 'test_*.py'

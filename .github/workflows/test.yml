@@ -25,7 +25,7 @@ jobs:
 
       # 엑셀 변환에 필요한 것과, PDF 이미지 복원에 쓰는 것. 나머지는 표준 라이브러리다.
       - name: 의존성 설치
-        run: python -m pip install --upgrade pip openpyxl pillow
+        run: python -m pip install --upgrade pip -r requirements.txt
 
       # 리눅스 러너에는 tkinter도 화면도 OCR 엔진도 없다. 셋 다 넣어야 GUI·OCR
       # 테스트가 건너뛰지 않고 실제로 돈다.

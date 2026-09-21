@@ -38,7 +38,7 @@ import xls
 from pathlib import Path
 
 VERSION = "0.1.0"
-CHECK_VERSION = "1"
+CHECK_VERSION = "2"
 
 SUCCESS, PARTIAL, UNVERIFIED, FAILED, UNSUPPORTED, SKIPPED = (
     "success", "partial", "unverified", "failed", "unsupported", "skipped")
@@ -1131,18 +1131,22 @@ def convert_xlsx(path: Path, opts, limits: Limits) -> Res:
     import openpyxl
     from openpyxl.utils import get_column_letter
 
+    def load_book(source, data_only):
+        with source.open("rb") as stream:
+            return openpyxl.load_workbook(stream, data_only=data_only, rich_text=False)
+
     res = Res(path, "xlsx")
     res.info["converter"] += " + openpyxl/%s" % openpyxl.__version__
     repaired = None
     try:
-        wb = openpyxl.load_workbook(path, data_only=False, rich_text=False)
-        wbv = openpyxl.load_workbook(path, data_only=True, rich_text=False)
+        wb = load_book(path, False)
+        wbv = load_book(path, True)
     except (TypeError, IndexError, KeyError, ValueError) as exc:
         repaired = _xlsx_repair_styles(path, limits)
         if repaired is None:
             raise
-        wb = openpyxl.load_workbook(repaired, data_only=False, rich_text=False)
-        wbv = openpyxl.load_workbook(repaired, data_only=True, rich_text=False)
+        wb = load_book(repaired, False)
+        wbv = load_book(repaired, True)
         res.warn("styles.xml을 그대로는 읽지 못해(%s: %s) 복사본에서 스타일 참조만 고쳐 "
                  "읽었다. 표시 형식은 원본 styles.xml과 따로 대조한다."
                  % (type(exc).__name__, str(exc)[:60]))
@@ -1312,6 +1316,8 @@ def convert_xlsx(path: Path, opts, limits: Limits) -> Res:
                         "문자열로 보존하며 mdmaker가 화면 표시를 재현하지는 않는다."}
     res.info["chars"] = len(res.markdown)
     verify_xlsx(res, path, cellmap, limits)      # 검사는 언제나 원본 파일로 한다
+    wb.close()
+    wbv.close()
     if repaired is not None:
         shutil.rmtree(repaired.parent, ignore_errors=True)
     return res
@@ -3227,7 +3233,7 @@ def make_pdfs(res: Res, src: Path, target: Path, assets_dir: Path, opts, limits:
         out_pdf = work / final_name
         err = soffice_to_pdf(src, out_pdf, limits)
         if err:
-            res.warn("원본 PDF를 만들지 못했다: %s" % err)
+            res.warn("원본 PDF를 만들지 못했다: %s. 쓸 수 없는 PDF를 남기지 않는다." % err)
         else:
             pages, checked, miss = verify_made_pdf(out_pdf, res.markdown)
             if _pdf_is_garbage(checked, miss):
@@ -3245,34 +3251,30 @@ def make_pdfs(res: Res, src: Path, target: Path, assets_dir: Path, opts, limits:
 
 
 def split_markdown(body: str, limit: int) -> list[str]:
-    """제목·문단 경계에서만 자른다. 한 덩어리가 한도보다 크면 줄 단위로 더 자른다."""
-    blocks = body.split("\n\n")
-    parts: list[list[str]] = [[]]
-    size = 0
-    for b in blocks:
-        if len(b) > limit:
-            lines = b.split("\n")
-            chunk: list[str] = []
-            for ln in lines:
-                if chunk and size + len(ln) + 1 > limit:
-                    parts[-1].append("\n".join(chunk))
-                    parts.append([])
-                    chunk, size = [], 0
-                chunk.append(ln)
-                size += len(ln) + 1
-            if chunk:
-                parts[-1].append("\n".join(chunk))
-            continue
-        if parts[-1] and size + len(b) + 2 > limit:
-            parts.append([])
-            size = 0
-        parts[-1].append(b)
-        size += len(b) + 2
-    return ["\n\n".join(p) for p in parts if p]
+    """문단, 줄, 문자 순으로 경계를 골라 원문을 바꾸지 않고 자른다."""
+    parts = []
+    chunk = ""
+    for block in re.split(r"(?<=\n\n)", body):
+        while block:
+            if len(chunk) == limit:
+                parts.append(chunk)
+                chunk = ""
+            room = limit - len(chunk)
+            if len(block) <= room:
+                chunk += block
+                break
+            cut = block.rfind("\n", 0, room + 1)
+            cut = cut + 1 if cut >= 0 else room
+            chunk += block[:cut]
+            parts.append(chunk)
+            chunk, block = "", block[cut:]
+    if chunk:
+        parts.append(chunk)
+    return parts
 
 
 def rejoin(parts: list[str]) -> str:
-    return "\n\n".join(parts)
+    return "".join(parts)
 
 
 def options_key(opts) -> str:
@@ -3305,16 +3307,32 @@ def cache_valid(entry: dict, src: Path, out_root: Path, opts) -> bool:
     try:
         if entry.get("source_sha256") != sha256(src.read_bytes()):
             return False
-        md = out_root / entry["md"]
-        if not md.exists() or sha256(md.read_bytes()) != entry.get("md_sha256"):
+        files = entry.get("files")
+        if not isinstance(files, dict) or not files:
             return False
-        for rel, want in (entry.get("assets") or {}).items():
+        for rel, want in files.items():
+            rel = Path(rel)
+            if rel.is_absolute() or ".." in rel.parts:
+                return False
             f = out_root / rel
             if not f.exists() or sha256(f.read_bytes()) != want:
                 return False
     except (OSError, KeyError):
         return False
     return True
+
+
+def output_artifacts(out_root: Path, rel: Path) -> list[Path]:
+    """같은 입력에서 만든 파일만 찾는다. 상태 전환과 옵션 변경 때 묵은 결과를 치운다."""
+    found = []
+    part_name = re.compile(re.escape(rel.name) + r"\.part\d+\.md\Z")
+    for base in (out_root, out_root / "_incomplete"):
+        parent = base / rel.parent
+        found.extend(parent / (rel.name + suffix)
+                     for suffix in (".md", ".assets", ".pdf", ".source.pdf"))
+        if parent.is_dir():
+            found.extend(p for p in parent.iterdir() if part_name.fullmatch(p.name))
+    return found
 
 
 def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
@@ -3335,8 +3353,9 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
     target = base / rel.parent / (rel.name + ".md")
     assets_dir = base / rel.parent / (rel.name + ".assets")
     # ours=True는 재사용 기록에 남아 있는, 우리가 만든 결과라는 뜻이다.
-    if not (opts.overwrite or ours) and (target.exists() or assets_dir.exists()):
-        return target, "출력이 이미 있다 (--overwrite 없이는 덮어쓰지 않는다): %s" % target
+    old = next((p for p in output_artifacts(out_root, rel) if p.exists()), None)
+    if not (opts.overwrite or ours) and old is not None:
+        return old, "출력이 이미 있다 (--overwrite 없이는 덮어쓰지 않는다): %s" % old
     target.parent.mkdir(parents=True, exist_ok=True)
     # 중간 실패로 기존 결과를 훼손하지 않도록 임시 위치에 묶음을 만든 뒤 옮긴다.
     tmp = Path(tempfile.mkdtemp(prefix=".mdmaker-", dir=str(target.parent)))
@@ -3386,6 +3405,16 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
             return target, "보조 폴더를 놓지 못했다(동시 실행 충돌일 수 있다): %s" % exc
         for made, name in pdf_files:
             os.replace(made, target.parent / name)
+        keep = {target, assets_dir}
+        keep.update(target.parent / p.name for p in made_parts)
+        keep.update(target.parent / name for _, name in pdf_files)
+        for stale in output_artifacts(out_root, rel):
+            if stale in keep or not stale.exists():
+                continue
+            if stale.is_symlink() or not stale.is_dir():
+                stale.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(stale)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return target, None
@@ -3424,6 +3453,29 @@ def check_options(files: list[Path], opts) -> str | None:
     return None
 
 
+def write_summary(out_root: Path, items: list[dict]) -> None:
+    counts = dict(sorted(collections.Counter(item["status"] for item in items).items()))
+    files = []
+    for item in items:
+        target = item["target"]
+        files.append({"path": item["rel"].as_posix(), "status": item["status"],
+                      "output": target.relative_to(out_root).as_posix() if target else None,
+                      "elapsed_sec": item["elapsed"], "warnings": item["warnings"]})
+    data = {"version": VERSION,
+            "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "complete": all(k in (SUCCESS, SKIPPED) for k in counts),
+            "counts": counts, "files": files}
+    out_root.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".summary-", suffix=".json", dir=out_root)
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, out_root / "summary.json")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def run_batch(files, root: Path, out_root: Path, opts, limits: Limits, single: bool = False):
     """파일 하나를 끝낼 때마다 결과를 내보낸다. CLI와 GUI가 같은 경로를 쓰게 하려는 것이다.
 
@@ -3431,17 +3483,22 @@ def run_batch(files, root: Path, out_root: Path, opts, limits: Limits, single: b
     "conflict"이고 warnings에 이유가 들어간다."""
     cache = load_cache(out_root) if opts.reuse else {}
     new_cache = dict(cache)
+    summary = []
     for f in files:
         rel = Path(f.name) if single else f.relative_to(root)
         if f.suffix.lower() not in SUPPORTED:
-            yield {"rel": rel, "status": UNSUPPORTED, "target": None, "elapsed": 0.0,
-                   "warnings": ["아직 지원하지 않는 형식이다"]}
+            item = {"rel": rel, "status": UNSUPPORTED, "target": None, "elapsed": 0.0,
+                    "warnings": ["아직 지원하지 않는 형식이다"]}
+            summary.append(item)
+            yield item
             continue
         key = str(rel)
         if opts.reuse and cache_valid(cache.get(key, {}), f, out_root, opts):
-            yield {"rel": rel, "status": SKIPPED, "target": out_root / cache[key]["md"],
-                   "elapsed": 0.0,
-                   "warnings": ["내용·옵션·결과가 이전 성공과 같다(재검증 통과)"]}
+            item = {"rel": rel, "status": SKIPPED, "target": out_root / cache[key]["md"],
+                    "elapsed": 0.0,
+                    "warnings": ["내용·옵션·결과가 이전 성공과 같다(재검증 통과)"]}
+            summary.append(item)
+            yield item
             continue
         t0 = time.perf_counter()
         try:
@@ -3460,31 +3517,35 @@ def run_batch(files, root: Path, out_root: Path, opts, limits: Limits, single: b
         target, conflict = write_result(res, f, root, out_root, opts,
                                         ours=bool(opts.reuse and key in cache), limits=limits)
         if conflict:
-            yield {"rel": rel, "status": "conflict", "target": target,
-                   "elapsed": res.info["elapsed_sec"], "warnings": [conflict]}
+            item = {"rel": rel, "status": "conflict", "target": target,
+                    "elapsed": res.info["elapsed_sec"], "warnings": [conflict]}
+            summary.append(item)
+            yield item
             continue
         if opts.reuse:
             if res.status == SUCCESS:
-                adir = target.parent / (rel.name + ".assets")
-                assets = {}
-                for a in sorted(res.assets):
-                    f2 = adir / a
-                    if f2.exists():
-                        assets[str(f2.relative_to(out_root))] = sha256(f2.read_bytes())
+                bundle_files = {}
+                for artifact in output_artifacts(out_root, rel):
+                    members = artifact.rglob("*") if artifact.is_dir() else (artifact,)
+                    for f2 in members:
+                        if f2.is_file():
+                            bundle_files[str(f2.relative_to(out_root))] = sha256(f2.read_bytes())
                 new_cache[key] = {"source_sha256": sha256(f.read_bytes()),
                                   "options": options_key(opts), "version": VERSION,
                                   "check_version": CHECK_VERSION, "status": res.status,
                                   "md": str(target.relative_to(out_root)),
-                                  "md_sha256": sha256(target.read_bytes()),
-                                  "assets": assets}
+                                  "files": bundle_files}
             else:
                 new_cache.pop(key, None)
-        yield {"rel": rel, "status": res.status, "target": target,
-               "elapsed": res.info["elapsed_sec"], "warnings": list(res.warnings)}
+        item = {"rel": rel, "status": res.status, "target": target,
+                "elapsed": res.info["elapsed_sec"], "warnings": list(res.warnings)}
+        summary.append(item)
+        yield item
     if opts.reuse and new_cache != cache:
         out_root.mkdir(parents=True, exist_ok=True)
         cache_path(out_root).write_text(json.dumps(new_cache, ensure_ascii=False, indent=1),
                                         encoding="utf-8")
+    write_summary(out_root, summary)
 
 
 def exit_code(counts: dict) -> int:

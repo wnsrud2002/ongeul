@@ -30,6 +30,16 @@ STATUS_TEXT = {
     "conflict": "기존 결과와 충돌",
 }
 
+COLORS = {
+    "bg": "#F1F3F9", "surface": "#FFFFFF", "line": "#DDE1EA",
+    "text": "#172033", "muted": "#667085", "brand": "#5946D2",
+    "brand_dark": "#342887", "success": "#18794E", "warning": "#9A6700",
+    "danger": "#C0362C",
+}
+OCR_VALUES = {"사용 안 함": "off", "자동": "auto", "항상": "force"}
+PDF_VALUES = {"만들지 않음": "off", "변환 결과": "result", "원본 문서": "source", "둘 다": "both"}
+XLSX_VALUES = {"자동": "auto", "Markdown 표": "md", "TSV 코드 블록": "tsv"}
+
 
 def open_path(path: Path) -> None:
     try:
@@ -52,96 +62,228 @@ class App:
         self.worker: threading.Thread | None = None
         self.stop = threading.Event()
         self.counts: dict = {}
-        root.title("온글 — 문서를 Markdown으로 · 로컬에서만 변환합니다")
-        root.geometry("900x620")
+        root.title("온글 — 문서를 안전하게 Markdown으로")
+        root.geometry("1040x760")
+        root.minsize(860, 640)
+        root.configure(background=COLORS["bg"])
         self._build()
+        modifier = "Command" if sys.platform == "darwin" else "Control"
+        root.bind("<%s-o>" % modifier, lambda _e: self.pick_files())
+        root.bind("<%s-Return>" % modifier, lambda _e: self.start())
         self.root.after(100, self._drain)
 
     # ---------------------------------------------------------------- 화면
     def _build(self) -> None:
-        pad = {"padx": 6, "pady": 4}
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", **pad)
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("App.TFrame", background=COLORS["bg"])
+        style.configure("Card.TFrame", background=COLORS["surface"], relief="solid", borderwidth=1)
+        style.configure("Hero.TFrame", background=COLORS["brand_dark"])
+        style.configure("Title.TLabel", background=COLORS["brand_dark"], foreground="white",
+                        font=("TkDefaultFont", 24, "bold"))
+        style.configure("HeroSubtitle.TLabel", background=COLORS["brand_dark"], foreground="#DAD6FF",
+                        font=("TkDefaultFont", 11))
+        style.configure("Subtitle.TLabel", background=COLORS["bg"], foreground=COLORS["muted"],
+                        font=("TkDefaultFont", 11))
+        style.configure("Section.TLabel", background=COLORS["surface"], foreground=COLORS["text"],
+                        font=("TkDefaultFont", 13, "bold"))
+        style.configure("Body.TLabel", background=COLORS["surface"], foreground=COLORS["text"])
+        style.configure("Muted.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
+        style.configure("Primary.TButton", background=COLORS["brand"], foreground="white",
+                        borderwidth=0, padding=(18, 10), font=("TkDefaultFont", 11, "bold"))
+        style.map("Primary.TButton", background=[("active", COLORS["brand_dark"]),
+                                                  ("disabled", "#B8B4DE")])
+        style.configure("Secondary.TButton", background="#EEF0F5", foreground=COLORS["text"],
+                        borderwidth=0, padding=(14, 9))
+        style.map("Secondary.TButton", background=[("active", "#E1E4EB")])
+        style.configure("Stop.TButton", background="#FEECEB", foreground=COLORS["danger"],
+                        borderwidth=0, padding=(14, 9))
+        style.configure("TCheckbutton", background=COLORS["surface"], foreground=COLORS["text"])
+        style.configure("TCombobox", padding=6)
+        style.configure("TEntry", padding=7)
+        style.configure("Results.Treeview", background="white", fieldbackground="white",
+                        foreground=COLORS["text"], rowheight=34, borderwidth=0)
+        style.configure("Results.Treeview.Heading", background="#F0F2F6",
+                        foreground="#475467", relief="flat", padding=(8, 8),
+                        font=("TkDefaultFont", 10, "bold"))
+        style.map("Results.Treeview", background=[("selected", "#E9E7FF")],
+                  foreground=[("selected", COLORS["text"])])
+        style.configure("Brand.Horizontal.TProgressbar", troughcolor="#E9E7F8",
+                        background=COLORS["brand"], borderwidth=0)
 
-        ttk.Button(top, text="파일 고르기", command=self.pick_files).grid(row=0, column=0)
-        ttk.Button(top, text="폴더 고르기", command=self.pick_dir).grid(row=0, column=1, padx=4)
-        self.in_var = tk.StringVar(value="입력을 고르세요")
-        ttk.Label(top, textvariable=self.in_var, width=70).grid(row=0, column=2, sticky="w")
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=(30, 24, 30, 22))
+        shell.pack(fill="both", expand=True)
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(4, weight=1)
 
-        ttk.Button(top, text="출력 폴더", command=self.pick_out).grid(row=1, column=0, pady=4)
+        header = ttk.Frame(shell, style="Hero.TFrame", padding=(22, 18))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
+        header.columnconfigure(0, weight=1)
+        brand = ttk.Frame(header, style="Hero.TFrame")
+        brand.grid(row=0, column=0, sticky="w")
+        ttk.Label(brand, text="온글", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(brand, text="문서를 빠짐없이 확인하고 Markdown으로 바꿉니다",
+                  style="HeroSubtitle.TLabel").pack(anchor="w", pady=(3, 0))
+        tk.Label(header, text="●  네트워크 전송 없음", bg="#FFFFFF", fg=COLORS["success"],
+                 padx=12, pady=7, font=("TkDefaultFont", 10, "bold")).grid(
+                     row=0, column=1, sticky="e")
+
+        source = ttk.Frame(shell, style="Card.TFrame", padding=(20, 16))
+        source.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        source.columnconfigure(2, weight=1)
+        ttk.Label(source, text="1  문서 선택", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 12))
+        ttk.Button(source, text="파일 선택", style="Primary.TButton",
+                   command=self.pick_files).grid(row=1, column=0, sticky="w")
+        ttk.Button(source, text="폴더 선택", style="Secondary.TButton",
+                   command=self.pick_dir).grid(row=1, column=1, sticky="w", padx=(8, 14))
+        self.in_var = tk.StringVar(value="변환할 파일이나 폴더를 선택하세요")
+        ttk.Label(source, textvariable=self.in_var, style="Body.TLabel").grid(
+            row=1, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(source, text="저장 위치", style="Muted.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(14, 0))
         self.out_var = tk.StringVar(value="")
-        ttk.Entry(top, textvariable=self.out_var, width=78).grid(row=1, column=1, columnspan=2,
-                                                                sticky="we")
+        self.out_var.trace_add("write", self._sync_actions)
+        ttk.Entry(source, textvariable=self.out_var).grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(8, 8), pady=(14, 0))
+        ttk.Button(source, text="변경", style="Secondary.TButton", command=self.pick_out).grid(
+            row=2, column=3, sticky="e", pady=(14, 0))
 
-        opt = ttk.LabelFrame(self.root, text="옵션")
-        opt.pack(fill="x", **pad)
+        opt = ttk.Frame(shell, style="Card.TFrame", padding=(20, 16))
+        opt.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        for i in range(6):
+            opt.columnconfigure(i, weight=1 if i in (1, 3, 5) else 0)
+        ttk.Label(opt, text="2  변환 설정", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
         self.recursive = tk.BooleanVar(value=True)
         self.overwrite = tk.BooleanVar(value=False)
         self.reuse = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text="하위 폴더까지", variable=self.recursive).grid(row=0, column=0)
-        ttk.Checkbutton(opt, text="기존 결과 덮어쓰기", variable=self.overwrite).grid(row=0, column=1)
-        ttk.Checkbutton(opt, text="이전 성공 결과 재사용", variable=self.reuse).grid(row=0, column=2)
+        checks = ttk.Frame(opt, style="Card.TFrame")
+        checks.grid(row=1, column=0, columnspan=6, sticky="w", pady=(0, 12))
+        ttk.Checkbutton(checks, text="하위 폴더 포함", variable=self.recursive).pack(side="left")
+        ttk.Checkbutton(checks, text="기존 결과 덮어쓰기", variable=self.overwrite).pack(
+            side="left", padx=(18, 0))
+        ttk.Checkbutton(checks, text="검증된 결과 재사용", variable=self.reuse).pack(
+            side="left", padx=(18, 0))
 
-        ttk.Label(opt, text="OCR").grid(row=0, column=3, padx=(16, 2))
-        self.ocr = tk.StringVar(value="off")
-        ttk.Combobox(opt, textvariable=self.ocr, values=("off", "auto", "force"), width=6,
-                     state="readonly").grid(row=0, column=4)
+        ttk.Label(opt, text="이미지 글자 읽기", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
+        self.ocr = tk.StringVar(value="사용 안 함")
+        ttk.Combobox(opt, textvariable=self.ocr, values=tuple(OCR_VALUES), width=13,
+                     state="readonly").grid(row=2, column=1, sticky="ew", padx=(8, 22))
         self.ocr_lang = tk.StringVar(value="kor+eng")
-        ttk.Entry(opt, textvariable=self.ocr_lang, width=10).grid(row=0, column=5, padx=2)
+        ttk.Label(opt, text="OCR 언어", style="Muted.TLabel").grid(row=2, column=2, sticky="w")
+        self.ocr_lang_entry = ttk.Entry(opt, textvariable=self.ocr_lang, width=10)
+        self.ocr_lang_entry.grid(
+            row=2, column=3, sticky="ew", padx=(8, 22))
+        self.ocr.trace_add("write", self._sync_actions)
 
-        ttk.Label(opt, text="분할(문자)").grid(row=0, column=6, padx=(16, 2))
+        ttk.Label(opt, text="분할 문자 수", style="Muted.TLabel").grid(row=2, column=4, sticky="w")
         self.split = tk.StringVar(value="0")
-        ttk.Entry(opt, textvariable=self.split, width=8).grid(row=0, column=7)
+        ttk.Entry(opt, textvariable=self.split, width=10).grid(row=2, column=5, sticky="ew", padx=(8, 0))
 
-        ttk.Label(opt, text="엑셀 표").grid(row=0, column=8, padx=(16, 2))
-        self.xlsx_table = tk.StringVar(value="auto")
-        ttk.Combobox(opt, textvariable=self.xlsx_table, values=("auto", "md", "tsv"), width=6,
-                     state="readonly").grid(row=0, column=9)
+        ttk.Label(opt, text="엑셀 표", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.xlsx_table = tk.StringVar(value="자동")
+        ttk.Combobox(opt, textvariable=self.xlsx_table, values=tuple(XLSX_VALUES), width=13,
+                     state="readonly").grid(row=3, column=1, sticky="ew", padx=(8, 22), pady=(10, 0))
+        ttk.Label(opt, text="PDF 출력", style="Muted.TLabel").grid(row=3, column=2, sticky="w", pady=(10, 0))
+        self.pdf = tk.StringVar(value="만들지 않음")
+        ttk.Combobox(opt, textvariable=self.pdf, values=tuple(PDF_VALUES), width=13,
+                     state="readonly").grid(row=3, column=3, sticky="ew", padx=(8, 22), pady=(10, 0))
+        ttk.Label(opt, text="PDF는 읽기용이며 Markdown 검증 상태에는 영향을 주지 않습니다",
+                  style="Muted.TLabel").grid(row=3, column=4, columnspan=2, sticky="w", pady=(10, 0))
 
-        run = ttk.Frame(self.root)
-        run.pack(fill="x", **pad)
-        self.run_btn = ttk.Button(run, text="변환 시작", command=self.start)
-        self.run_btn.pack(side="left")
-        self.stop_btn = ttk.Button(run, text="중단", command=self.stop.set, state="disabled")
-        self.stop_btn.pack(side="left", padx=4)
-        ttk.Button(run, text="결과 폴더 열기",
-                   command=lambda: open_path(Path(self.out_var.get() or "."))).pack(side="left")
-        self.bar = ttk.Progressbar(run, mode="determinate", length=320)
-        self.bar.pack(side="right")
+        run = ttk.Frame(shell, style="App.TFrame")
+        run.grid(row=3, column=0, sticky="ew", pady=(2, 12))
+        run.columnconfigure(3, weight=1)
+        self.run_btn = ttk.Button(run, text="변환 시작", style="Primary.TButton",
+                                  command=self.start, state="disabled")
+        self.run_btn.grid(row=0, column=0, sticky="w")
+        self.stop_btn = ttk.Button(run, text="중단", style="Stop.TButton",
+                                   command=self.stop.set, state="disabled")
+        self.stop_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.open_btn = ttk.Button(run, text="결과 폴더 열기", style="Secondary.TButton",
+                                   command=lambda: open_path(Path(self.out_var.get() or ".")))
+        self.open_btn.grid(row=0, column=2, sticky="w", padx=(8, 18))
+        self.bar = ttk.Progressbar(run, mode="determinate", style="Brand.Horizontal.TProgressbar")
+        self.bar.grid(row=0, column=3, sticky="ew", padx=(0, 12))
+        self.progress_text = tk.StringVar(value="준비됨")
+        ttk.Label(run, textvariable=self.progress_text, style="Subtitle.TLabel").grid(
+            row=0, column=4, sticky="e")
 
+        results = ttk.Frame(shell, style="Card.TFrame", padding=(20, 16))
+        results.grid(row=4, column=0, sticky="nsew")
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(1, weight=1)
+        head = ttk.Frame(results, style="Card.TFrame")
+        head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        head.columnconfigure(0, weight=1)
+        ttk.Label(head, text="3  변환 결과", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(head, text="행을 두 번 누르면 결과를 엽니다", style="Muted.TLabel").grid(
+            row=0, column=1, sticky="e")
         cols = ("status", "meaning", "file", "note")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=16)
-        for c, t, w in (("status", "상태", 90), ("meaning", "뜻", 150),
-                        ("file", "파일", 300), ("note", "경고", 330)):
+        self.tree = ttk.Treeview(results, columns=cols, show="headings", height=9,
+                                 style="Results.Treeview")
+        for c, t, w, stretch in (("status", "상태", 90, False), ("meaning", "검증 결과", 160, False),
+                                 ("file", "파일", 250, True), ("note", "안내", 360, True)):
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w")
-        self.tree.pack(fill="both", expand=True, **pad)
+            self.tree.column(c, width=w, minwidth=70, anchor="w", stretch=stretch)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(results, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind("<Double-1>", self._open_row)
+        self.tree.tag_configure(M.SUCCESS, background="#ECFDF3", foreground=COLORS["success"])
+        self.tree.tag_configure(M.SKIPPED, background="#EEF4FF", foreground="#2458A6")
+        self.tree.tag_configure(M.UNVERIFIED, background="#FFF9E8", foreground=COLORS["warning"])
+        self.tree.tag_configure(M.PARTIAL, background="#FFF4E8", foreground="#A04B00")
+        self.tree.tag_configure(M.FAILED, background="#FEF0EF", foreground=COLORS["danger"])
+        self.tree.tag_configure(M.UNSUPPORTED, background="#F3F4F6", foreground="#5F6673")
+        self.tree.tag_configure("conflict", background="#FEF0EF", foreground=COLORS["danger"])
         self.rows: dict = {}
+        self.empty = tk.Label(results, text="아직 변환한 문서가 없습니다\n위에서 파일이나 폴더를 선택해 시작하세요",
+                              bg="white", fg=COLORS["muted"], justify="center",
+                              font=("TkDefaultFont", 11), pady=22)
+        self.empty.place(relx=0.5, rely=0.58, anchor="center")
 
         self.summary = tk.StringVar(
-            value="success 만 완전 보존 검증을 통과한 결과다. 나머지는 원본을 대체할 수 없다.")
-        ttk.Label(self.root, textvariable=self.summary, anchor="w").pack(fill="x", **pad)
+            value="대기 중 · 원본은 변경하지 않으며, 검증을 통과한 결과만 완료로 표시합니다.")
+        self.summary_label = tk.Label(shell, textvariable=self.summary, anchor="w",
+                                      bg="#ECEAFB", fg=COLORS["brand_dark"], padx=14, pady=10,
+                                      font=("TkDefaultFont", 10, "bold"))
+        self.summary_label.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        self._sync_actions()
+
+    def _sync_actions(self, *_args) -> None:
+        running = bool(self.worker and self.worker.is_alive())
+        self.run_btn["state"] = "normal" if self.inputs and self.out_var.get() and not running else "disabled"
+        self.ocr_lang_entry["state"] = "normal" if self.ocr.get() != "사용 안 함" else "disabled"
 
     # ---------------------------------------------------------------- 입력
     def pick_files(self) -> None:
         got = filedialog.askopenfilenames(title="변환할 파일")
         if got:
             self.inputs = [Path(g) for g in got]
-            self.in_var.set("파일 %d개" % len(self.inputs))
+            names = ", ".join(p.name for p in self.inputs[:3])
+            tail = " 외 %d개" % (len(self.inputs) - 3) if len(self.inputs) > 3 else ""
+            self.in_var.set("파일 %d개 · %s%s" % (len(self.inputs), names, tail))
             self._suggest_out(self.inputs[0].parent)
+            self._sync_actions()
 
     def pick_dir(self) -> None:
         got = filedialog.askdirectory(title="변환할 폴더")
         if got:
             self.inputs = [Path(got)]
-            self.in_var.set(got)
+            self.in_var.set("폴더 · %s" % got)
             self._suggest_out(Path(got).parent)
+            self._sync_actions()
 
     def pick_out(self) -> None:
         got = filedialog.askdirectory(title="결과를 저장할 폴더")
         if got:
             self.out_var.set(got)
+            self._sync_actions()
 
     def _suggest_out(self, base: Path) -> None:
         if not self.out_var.get():
@@ -167,8 +309,9 @@ class App:
         opts = argparse.Namespace(
             out=self.out_var.get(), recursive=self.recursive.get(),
             overwrite=self.overwrite.get(), reuse=self.reuse.get(), encoding=None,
-            xlsx_table=self.xlsx_table.get(), max_cells=2_000_000, ocr=self.ocr.get(),
-            ocr_lang=self.ocr_lang.get(), split_chars=split)
+            xlsx_table=XLSX_VALUES[self.xlsx_table.get()], max_cells=2_000_000,
+            ocr=OCR_VALUES[self.ocr.get()], ocr_lang=self.ocr_lang.get(), split_chars=split,
+            pdf=PDF_VALUES[self.pdf.get()], pdf_engine="builtin", pdf_font=None)
         out_root = Path(opts.out)
         src = self.inputs[0]
         if len(self.inputs) == 1 and src.is_dir():
@@ -190,9 +333,13 @@ class App:
         self.counts = {}
         self.bar["maximum"] = len(files)
         self.bar["value"] = 0
+        self.progress_text.set("0 / %d" % len(files))
+        self.empty.place(relx=0.5, rely=0.58, anchor="center")
         self.stop.clear()
         self.run_btn["state"] = "disabled"
         self.stop_btn["state"] = "normal"
+        self.summary.set("변환 중 · 원본은 그대로 두고 결과를 검사하고 있습니다.")
+        self.summary_label.configure(bg="#ECEAFB", fg=COLORS["brand_dark"])
         self.worker = threading.Thread(
             target=self._work, args=(files, root, out_root, opts, single), daemon=True)
         self.worker.start()
@@ -203,23 +350,27 @@ class App:
             for item in M.run_batch(files, root, out_root, opts, limits, single=single):
                 self.q.put(item)
                 if self.stop.is_set():
-                    self.q.put({"stopped": True})
                     break
         except Exception as exc:                  # 창이 조용히 죽지 않게 한다
             self.q.put({"error": "%s: %s" % (type(exc).__name__, exc)})
-        self.q.put({"done": True})
+        self.q.put({"done": True, "stopped": self.stop.is_set()})
 
     def _drain(self) -> None:
         try:
             while True:
                 item = self.q.get_nowait()
                 if item.get("done"):
-                    self.run_btn["state"] = "normal"
                     self.stop_btn["state"] = "disabled"
-                    self._summarize(final=True)
-                elif item.get("stopped"):
-                    self.summary.set("중단했다. 여기까지의 결과만 저장돼 있다.")
+                    if item.get("stopped"):
+                        self.summary.set("중단됨 · 이미 변환한 결과는 저장되었습니다.")
+                        self.progress_text.set("중단됨")
+                        self.summary_label.configure(bg="#FFF4E8", fg="#A04B00")
+                    else:
+                        self.progress_text.set("완료")
+                        self._summarize(final=True)
+                    self._sync_actions()
                 elif item.get("error"):
+                    self.progress_text.set("오류")
                     messagebox.showerror("변환 중 오류", item["error"])
                 else:
                     self._add(item)
@@ -232,21 +383,25 @@ class App:
         self.counts[st] = self.counts.get(st, 0) + 1
         note = "; ".join(item["warnings"][:2])
         iid = self.tree.insert("", "end", values=(st, STATUS_TEXT.get(st, st),
-                                                  str(item["rel"]), note))
-        self.tree.item(iid, tags=("ok",) if st == M.SUCCESS else ("check",))
-        self.tree.tag_configure("check", background="#fff6e0")
+                                                    str(item["rel"]), note), tags=(st,))
+        self.empty.place_forget()
         self.rows[iid] = item["target"]
         self.bar["value"] += 1
+        self.progress_text.set("%d / %d" % (int(self.bar["value"]), int(self.bar["maximum"])))
         self._summarize()
 
     def _summarize(self, final: bool = False) -> None:
-        parts = ", ".join("%s %d" % (k, v) for k, v in sorted(self.counts.items()))
+        parts = " · ".join("%s %d" % (STATUS_TEXT.get(k, k), v)
+                           for k, v in sorted(self.counts.items()))
         done = M.exit_code(self.counts) == 0
         tail = ""
         if final:
             tail = ("  ·  모든 입력이 완전 보존 검증을 통과했다."
                     if done else
                     "  ·  success가 아닌 결과는 완료가 아니다. `_incomplete` 폴더와 경고를 확인할 것.")
+            self.summary_label.configure(
+                bg="#EAF8F1" if done else "#FFF4E8",
+                fg=COLORS["success"] if done else "#A04B00")
         self.summary.set((parts or "결과 없음") + tail)
 
 

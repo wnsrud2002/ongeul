@@ -127,6 +127,7 @@ def make_xlsx(path: Path) -> None:
     hid["A1"] = "숨겨진값"
     hid.sheet_state = "hidden"
     wb.save(path)
+    wb.close()
     _inject_empty_string_cell(path)
 
 
@@ -314,6 +315,16 @@ class TestXlsx(Tmp):
 
 
 class TestPipeline(Tmp):
+    def test_batch_writes_machine_readable_summary(self):
+        (self.inp / "정상.txt").write_text("안녕", encoding="utf-8")
+        (self.inp / "검수.png").write_bytes(PNG)
+        self.assertEqual(self.run_cli(self.inp, "--out", self.out), 1)
+        summary = json.loads((self.out / "summary.json").read_text(encoding="utf-8"))
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["counts"], {"success": 1, "unverified": 1})
+        self.assertEqual([(f["path"], f["output"]) for f in summary["files"]], [
+            ("검수.png", "_incomplete/검수.png.md"), ("정상.txt", "정상.txt.md")])
+
     def test_batch_recursive_and_mixed_status(self):
         (self.inp / "재무").mkdir()
         (self.inp / "재무" / "메모.txt").write_text("안녕", encoding="utf-8")
@@ -1250,6 +1261,12 @@ class TestSplitAndReuse(Tmp):
         self.assertIn("문자 기준 분할(토큰 수와 다르다)",
                       sorted(self.out.glob("긴문서.txt.part*.md"))[0].read_text(encoding="utf-8"))
 
+    def test_split_limits_long_unbroken_line_without_changing_it(self):
+        body = "가" * 2501
+        parts = M.split_markdown(body, 1000)
+        self.assertEqual(M.rejoin(parts), body)
+        self.assertEqual([len(p) for p in parts], [1000, 1000, 501])
+
     def test_reuse_skips_only_when_everything_matches(self):
         p = self.inp / "a.txt"
         p.write_text("처음", encoding="utf-8")
@@ -1269,6 +1286,39 @@ class TestSplitAndReuse(Tmp):
         (self.out / "a.txt.md").unlink()
         self.assertEqual(self.run_cli(p, "--out", self.out, "--reuse"), 0)
         self.assertTrue((self.out / "a.txt.md").exists())     # 결과가 없으면 다시 만든다
+
+    def test_reuse_refuses_when_metadata_missing(self):
+        p = self.inp / "a.txt"
+        p.write_text("처음", encoding="utf-8")
+        self.run_cli(p, "--out", self.out, "--reuse")
+        meta = self.out / "a.txt.assets" / "meta.json"
+        meta.unlink()
+        self.assertEqual(self.run_cli(p, "--out", self.out, "--reuse"), 0)
+        self.assertTrue(meta.exists())
+
+    def test_overwrite_removes_stale_split_parts(self):
+        p = self._long_text()
+        self.run_cli(p, "--out", self.out, "--split-chars", "1200")
+        self.assertTrue(list(self.out.glob("긴문서.txt.part*.md")))
+        self.assertEqual(self.run_cli(p, "--out", self.out, "--overwrite"), 0)
+        self.assertEqual(list(self.out.glob("긴문서.txt.part*.md")), [])
+
+    def test_status_change_does_not_leave_two_results(self):
+        p = self.inp / "a.txt"
+        p.write_text("한글", encoding="utf-8")
+        self.assertEqual(self.run_cli(p, "--out", self.out), 0)
+
+        self.assertEqual(self.run_cli(p, "--out", self.out, "--encoding", "ascii"), 1)
+        self.assertFalse((self.out / "_incomplete" / "a.txt.md").exists())
+
+        self.assertEqual(self.run_cli(p, "--out", self.out, "--encoding", "ascii",
+                                      "--overwrite"), 1)
+        self.assertFalse((self.out / "a.txt.md").exists())
+        self.assertTrue((self.out / "_incomplete" / "a.txt.md").exists())
+
+        self.assertEqual(self.run_cli(p, "--out", self.out, "--overwrite"), 0)
+        self.assertTrue((self.out / "a.txt.md").exists())
+        self.assertFalse((self.out / "_incomplete" / "a.txt.md").exists())
 
 
 CHART_XML = f"""<?xml version="1.0"?>
@@ -1628,6 +1678,16 @@ class TestGui(Tmp):
                    M.SKIPPED, "conflict"):
             self.assertIn(st, self.gui.STATUS_TEXT)
 
+    def test_actions_follow_user_choices(self):
+        self.assertEqual(str(self.app.run_btn["state"]), "disabled")
+        self.assertEqual(str(self.app.ocr_lang_entry["state"]), "disabled")
+        self.app.inputs = [self.inp / "a.txt"]
+        self.app.out_var.set(str(self.out))
+        self.app.ocr.set("자동")
+        self.app._sync_actions()
+        self.assertEqual(str(self.app.run_btn["state"]), "normal")
+        self.assertEqual(str(self.app.ocr_lang_entry["state"]), "normal")
+
     def test_worker_error_is_surfaced_not_swallowed(self):
         def boom(*a, **k):
             raise RuntimeError("일부러 낸 오류")
@@ -1681,7 +1741,9 @@ class TestAppBundle(Tmp):
             self.skipTest("Pillow 없음")
         im = self.build_app.draw_icon(32)
         self.assertEqual(im.size, (32, 32))
-        colors = {p[:3] for p in im.getdata() if p[3] > 200}
+        pixels = (im.get_flattened_data() if hasattr(im, "get_flattened_data")
+                  else im.getdata())
+        colors = {p[:3] for p in pixels if p[3] > 200}
         self.assertGreater(len(colors), 4)       # 단색 사각형이 아니라 그림이 들어있다
 
 
@@ -1837,6 +1899,7 @@ class TestXlsxVerification(Tmp):
                             "raw": c.value, "formula": None,
                             "rendered": M._xl_value(c.value),
                             "nf": "엉뚱한서식", "type": c.data_type}
+        wb.close()
         M.verify_xlsx(tampered, p, cellmap, M.Limits())
         self.assertEqual(tampered.status, M.PARTIAL)
         self.assertIn("number_format", " ".join(tampered.warnings))
@@ -1856,6 +1919,7 @@ class TestXlsxVerification(Tmp):
         img_path.write_bytes(PNG)
         wb["매출"].add_image(XLImage(str(img_path)), "D4")
         wb.save(p)
+        wb.close()
         self.assertEqual(self.run_cli(p, "--out", self.out), 0)
         md = self.md_of("그림.xlsx")
         self.assertIn("시트 `매출` 의 `D4` 칸", md)
