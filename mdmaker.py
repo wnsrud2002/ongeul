@@ -37,7 +37,7 @@ import pdfwrite
 import xls
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 CHECK_VERSION = "2"
 
 SUCCESS, PARTIAL, UNVERIFIED, FAILED, UNSUPPORTED, SKIPPED = (
