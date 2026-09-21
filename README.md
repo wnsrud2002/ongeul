@@ -142,7 +142,7 @@ python3 mdmaker.py 입력 --out 출력 --pdf both     # 원본 문서도 → PDF
 
 success가 아닌 것의 사유는 **전부 특정돼 있다** — PDF 구조상 확인 불가(222) · PDF 폰트에 대응표 없음(31) · 암호화 PDF(4) · 이미지 내용(2) · 글자도 이미지도 없는 순수 도형(3).
 
-테스트 **125개** 통과. 그중 **8개는 일부러 망가뜨린 결과가 `success` 로 올라가지 않는지** 보는 실패 검증이다.
+테스트 **128개** 통과. 그중 **8개는 일부러 망가뜨린 결과가 `success` 로 올라가지 않는지** 보는 실패 검증이다.
 CI는 **리눅스 · macOS · 윈도우 × 파이썬 3.11 / 3.12 / 3.13 = 9개 조합**에서 돈다.
 
 <br>
@@ -185,6 +185,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 | `--reuse` | 내용 해시·옵션·버전이 모두 같고 결과까지 온전할 때만 건너뜀 |
 | `--pdf result\|source\|both` | PDF도 만든다 |
 | `--pdf-engine builtin\|soffice`, `--pdf-font` | 결과 PDF 생성기와 글꼴 |
+| `--no-md` | `--pdf` 와 함께 쓰면 `.md` 없이 PDF만 남긴다. 검증은 그대로 하고 기록은 `.assets/meta.json` 에 남는다 |
 
 출력은 이렇게 놓인다.
 
@@ -215,7 +216,7 @@ python3 mdmaker.py 입력 --out 출력 [옵션]
 | `xls.py` | 구형 엑셀(BIFF8) 문자열·시트 이름 리더 |
 | `gui.py` | 창 화면 (tkinter). CLI와 같은 변환 경로를 쓴다 |
 | `build_app.py` | macOS `.app` 묶음 만들기 (iconutil + plistlib) |
-| `test_mdmaker.py` | 테스트 125개 (표준 `unittest`, 프레임워크 없음) |
+| `test_mdmaker.py` | 테스트 128개 (표준 `unittest`, 프레임워크 없음) |
 
 ```sh
 python3 -m unittest discover -s . -p 'test_*.py'

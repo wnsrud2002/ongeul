@@ -160,12 +160,15 @@ class App:
         self.recursive = tk.BooleanVar(value=True)
         self.overwrite = tk.BooleanVar(value=False)
         self.reuse = tk.BooleanVar(value=False)
+        self.make_md = tk.BooleanVar(value=True)
         checks = ttk.Frame(opt, style="Card.TFrame")
         checks.grid(row=1, column=0, columnspan=6, sticky="w", pady=(0, 12))
         ttk.Checkbutton(checks, text="하위 폴더 포함", variable=self.recursive).pack(side="left")
         ttk.Checkbutton(checks, text="기존 결과 덮어쓰기", variable=self.overwrite).pack(
             side="left", padx=(18, 0))
         ttk.Checkbutton(checks, text="검증된 결과 재사용", variable=self.reuse).pack(
+            side="left", padx=(18, 0))
+        ttk.Checkbutton(checks, text="Markdown 파일 남기기", variable=self.make_md).pack(
             side="left", padx=(18, 0))
 
         ttk.Label(opt, text="이미지 글자 읽기", style="Muted.TLabel").grid(row=2, column=0, sticky="w")
@@ -311,7 +314,8 @@ class App:
             overwrite=self.overwrite.get(), reuse=self.reuse.get(), encoding=None,
             xlsx_table=XLSX_VALUES[self.xlsx_table.get()], max_cells=2_000_000,
             ocr=OCR_VALUES[self.ocr.get()], ocr_lang=self.ocr_lang.get(), split_chars=split,
-            pdf=PDF_VALUES[self.pdf.get()], pdf_engine="builtin", pdf_font=None)
+            pdf=PDF_VALUES[self.pdf.get()], pdf_engine="builtin", pdf_font=None,
+            no_md=not self.make_md.get())
         out_root = Path(opts.out)
         src = self.inputs[0]
         if len(self.inputs) == 1 and src.is_dir():

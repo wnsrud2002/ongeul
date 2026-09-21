@@ -37,7 +37,7 @@ import pdfwrite
 import xls
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 CHECK_VERSION = "2"
 
 SUCCESS, PARTIAL, UNVERIFIED, FAILED, UNSUPPORTED, SKIPPED = (
@@ -3280,7 +3280,7 @@ def rejoin(parts: list[str]) -> str:
 def options_key(opts) -> str:
     return json.dumps({k: getattr(opts, k, None)
                        for k in ("encoding", "xlsx_table", "max_cells", "ocr", "ocr_lang",
-                                 "split_chars", "pdf", "pdf_engine", "pdf_font")},
+                                 "split_chars", "pdf", "pdf_engine", "pdf_font", "no_md")},
                       ensure_ascii=False, sort_keys=True)
 
 
@@ -3377,6 +3377,10 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
             f2.write_bytes(data)
             listing.append({"path": name, "sha256": sha256(data), "bytes": len(data)})
         pdf_files = make_pdfs(res, src, target, adir, opts, limits or Limits(), tmp)
+        drop_md = bool(getattr(opts, "no_md", False))
+        if drop_md and not pdf_files:
+            drop_md = False
+            res.warn("PDF를 만들지 못해 --no-md 여도 Markdown 을 남겼다(결과가 하나도 없게 하지 않는다)")
         # 본문과 기록은 PDF까지 만든 뒤에 쓴다. PDF에서 생긴 경고도 상태에 남아야 한다.
         (tmp / "doc.md").write_text(res.markdown + status_section(res),
                                     encoding="utf-8", newline="\n")
@@ -3405,7 +3409,8 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
             return target, "보조 폴더를 놓지 못했다(동시 실행 충돌일 수 있다): %s" % exc
         for made, name in pdf_files:
             os.replace(made, target.parent / name)
-        keep = {target, assets_dir}
+        # --no-md 여도 .md 는 위에서 동시 실행을 막는 자리로 먼저 쓰고, 여기서 치운다.
+        keep = {assets_dir} if drop_md else {target, assets_dir}
         keep.update(target.parent / p.name for p in made_parts)
         keep.update(target.parent / name for _, name in pdf_files)
         for stale in output_artifacts(out_root, rel):
@@ -3417,6 +3422,8 @@ def write_result(res: Res, src: Path, root: Path, out_root: Path, opts,
                 shutil.rmtree(stale)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    if drop_md:
+        return target.parent / pdf_files[0][1], None
     return target, None
 
 
@@ -3450,6 +3457,11 @@ def check_options(files: list[Path], opts) -> str | None:
         return "--pdf %s 는 LibreOffice 가 있어야 한다(원본을 그대로 PDF로 만드는 유일한 길)" % opts.pdf
     if opts.pdf == "off" and opts.pdf_engine != "builtin":
         return "--pdf-engine 은 --pdf 와 함께 쓴다"
+    if getattr(opts, "no_md", False):
+        if opts.pdf == "off":
+            return "--no-md 는 --pdf 와 함께 쓴다(아무 결과도 남지 않는다)"
+        if opts.split_chars:
+            return "--no-md 와 --split-chars 는 함께 쓸 수 없다(조각은 Markdown 이다)"
     return None
 
 
@@ -3596,6 +3608,8 @@ def main(argv=None) -> int:
     ap.add_argument("--pdf-engine", choices=("builtin", "soffice"), default="builtin",
                     help="결과 PDF 생성기 (builtin=의존성 없음, soffice=LibreOffice)")
     ap.add_argument("--pdf-font", help="결과 PDF에 넣을 글꼴 파일 (기본은 시스템 한글 글꼴)")
+    ap.add_argument("--no-md", action="store_true",
+                    help="Markdown 파일은 남기지 않고 PDF만 남긴다 (검증은 그대로 한다)")
     ap.add_argument("--reuse", action="store_true",
                     help="이전에 전체 보존 검증을 통과한 결과를 재검증 후 건너뛴다")
     opts = ap.parse_args(argv)

@@ -2079,6 +2079,36 @@ class TestPdfExport(Tmp):
         self.run_cli(self.inp / "a.docx", "--out", self.out)
         self.assertEqual(list(self.out.glob("*.pdf")), [])
 
+    def test_pdf_only_leaves_no_markdown(self):
+        make_docx(self.inp / "a.docx")
+        args = (self.inp / "a.docx", "--out", self.out, "--pdf", "result", "--no-md", "--reuse")
+        self.assertEqual(self.run_cli(*args), 0)
+        self.assertTrue((self.out / "a.docx.pdf").exists())
+        self.assertFalse((self.out / "a.docx.md").exists())
+        meta = json.loads((self.out / "a.docx.assets" / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["status"], "success")         # 검증은 그대로 했다
+        summary = json.loads((self.out / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["files"][0]["output"], "a.docx.pdf")
+        self.assertEqual(self.run_cli(*args), 0)            # PDF만 있어도 재사용된다
+        self.assertFalse((self.out / "a.docx.md").exists())
+
+    def test_no_md_needs_pdf_and_no_split(self):
+        make_docx(self.inp / "a.docx")
+        self.assertEqual(self.run_cli(self.inp / "a.docx", "--out", self.out, "--no-md"), 2)
+        self.assertEqual(self.run_cli(self.inp / "a.docx", "--out", self.out, "--no-md",
+                                      "--pdf", "result", "--split-chars", "100"), 2)
+
+    def test_no_md_keeps_markdown_when_pdf_fails(self):
+        """PDF를 못 만들었는데 Markdown까지 지우면 아무것도 남지 않는다."""
+        make_docx(self.inp / "a.docx")
+        saved = pdfwrite.find_font
+        pdfwrite.find_font = lambda *a, **k: (None, "글꼴 없음")
+        try:
+            self.run_cli(self.inp / "a.docx", "--out", self.out, "--pdf", "result", "--no-md")
+        finally:
+            pdfwrite.find_font = saved
+        self.assertIn("Markdown 을 남겼다", self.md_of("a.docx"))
+
     def test_source_pdf_needs_libreoffice(self):
         make_docx(self.inp / "a.docx")
         if M.soffice_path():
