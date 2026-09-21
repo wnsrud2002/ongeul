@@ -37,7 +37,7 @@ import pdfwrite
 import xls
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CHECK_VERSION = "2"
 
 SUCCESS, PARTIAL, UNVERIFIED, FAILED, UNSUPPORTED, SKIPPED = (
@@ -3471,7 +3471,12 @@ def write_summary(out_root: Path, items: list[dict]) -> None:
     tmp = Path(name)
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, out_root / "summary.json")
+        target = out_root / "summary.json"
+        try:
+            os.replace(tmp, target)
+        except PermissionError:
+            if not target.exists():
+                raise
     finally:
         tmp.unlink(missing_ok=True)
 
